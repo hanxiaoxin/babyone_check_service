@@ -3,3 +3,51 @@
 @supports (appearance:base-select){select,::picker(select){appearance:base-select}select{background-image:none;padding-right:13px;align-items:center}select::picker-icon{color:#8594ad;transition:rotate .15s}select:open::picker-icon{rotate:180deg}::picker(select){border:1px solid #dce4f0;border-radius:11px;box-shadow:0 12px 32px #263d6924;padding:6px;background:white;max-height:280px;overflow:auto}option{border-radius:6px;padding:10px 12px;gap:10px}option:hover,option:focus{background:#edf3ff;color:#365eea}option:checked{background:#e9f0ff;color:#365eea;font-weight:600}option::checkmark{color:#365eea;order:1;margin-left:auto}}
 @media(min-width:1000px){#targets{grid-template-columns:repeat(3,minmax(0,1fr))}}@media(max-width:760px){main{padding:22px 16px 40px}header{padding:16px 20px}header>div{gap:10px}header small{display:none}section{padding:20px}#project-form{grid-template-columns:1fr}#project-form textarea{height:80px}.form-grid{grid-template-columns:1fr}.grid{grid-template-columns:repeat(auto-fit,minmax(260px,1fr))}.filters label{min-width:0;flex:1}.brand{font-size:20px}nav{width:100%}nav button{flex:1;padding:10px 8px;white-space:nowrap}.heading{align-items:flex-start}.dialog-body{padding:20px}.dialog-body>.heading{top:-20px}.dialog-body h2{font-size:16px}}@media(max-width:480px){section{padding:16px;border-radius:14px}.filters{flex-direction:column}.grid{grid-template-columns:1fr}.list-meta{align-items:flex-start;flex-direction:column;gap:4px}.heading h1{font-size:23px}.card{padding:16px}.dialog-footer{align-items:flex-start;flex-direction:column}#login{margin-top:30px;padding:24px}dialog{width:calc(100vw - 20px);max-height:calc(100dvh - 24px)}.dialog-body{padding:16px}.dialog-body>.heading{top:-16px}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important;scroll-behavior:auto!important}}
+
+/* Compact layout: keep the overview readable without large decorative gaps. */
+:root{font-size:13px;line-height:1.5}
+header{padding:12px max(20px,calc((100vw - 1320px)/2))}
+header>div{gap:14px}.brand{font-size:19px}header small{padding-left:14px}
+main{max-width:1360px;padding:12px 20px 24px}
+section{padding:16px;margin-top:12px;border-radius:12px;box-shadow:0 2px 12px #263b6608}
+h1{font-size:21px;margin-bottom:2px}h2{font-size:16px;margin:18px 0 12px}h3{font-size:15px}
+.heading{margin-bottom:12px;gap:12px}.heading p{font-size:12px}
+button{padding:6px 12px;border-radius:7px;font-size:12px}
+nav{width:100%;gap:20px;padding:0;background:transparent;border:0;border-bottom:1px solid #dfe5ef;border-radius:0}
+nav button{position:relative;flex:0 0 auto;background:transparent;color:#738099;border:0;border-radius:0;padding:9px 2px;box-shadow:none;font-size:13px}
+nav button.active{background:transparent;color:#365eea;box-shadow:none}
+nav button.active::after{content:"";position:absolute;bottom:-1px;left:0;right:0;height:2px;background:#365eea;border-radius:2px}
+nav button:hover:not(:disabled){background:transparent;color:#365eea;box-shadow:none;transform:none}
+nav button:active:not(:disabled){transform:none}
+label{gap:4px;font-size:12px}
+input,textarea,select{padding:7px 10px;border-radius:7px;font-size:13px}
+select{padding-right:32px;background-position:right 10px center}
+form{gap:12px;margin-bottom:18px}textarea{min-height:72px}
+.form-grid>button{min-width:100px}#project-form{padding:14px;gap:12px}
+#project-form textarea{min-height:35px;height:35px}
+.filters{padding:0;background:transparent;border:0;border-radius:0;gap:16px;align-items:center}
+.filters label{flex-direction:row;align-items:center;gap:8px;min-width:0;font-weight:400;white-space:nowrap}
+.filters select{width:180px}
+.list-meta{margin:10px 0 8px;gap:8px}.list-meta p,.list-meta small{font-size:11px}
+.grid{gap:10px}.card{padding:12px;border-radius:10px}.card-heading{margin-bottom:7px;gap:8px}
+.card p{font-size:12px;margin-bottom:7px;line-height:1.45}
+.card p.target-address{padding:5px 8px;font-size:11px;line-height:1.5;margin-bottom:7px}
+.target-card .project-description{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.target-card .target-address{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.target-meta{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:7px;font-size:11px;color:#78859a}
+.target-meta span{white-space:nowrap}
+.badge{padding:2px 6px;font-size:11px}
+.expiry{padding:7px 9px;border-radius:7px;margin:0 0 9px}
+.expiry p{font-size:11px;margin-bottom:3px}.expiry-detail strong{font-size:12px}.expiry-label{font-size:10px;padding:1px 5px}
+.actions{gap:7px;padding-top:8px}.actions button{font-size:11px;padding:5px 9px}
+.pager{margin-top:14px;gap:8px}.pager span{font-size:12px}
+.check{padding:8px;min-height:36px;gap:8px}.check input{width:16px;height:16px}
+.target-error{margin:0 0 8px;font-size:11px;color:#c57627}.target-error summary{cursor:pointer}.target-error p{margin-top:6px;font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere}
+.card label{margin:10px 0}#message{padding:8px 12px;margin-bottom:12px;font-size:12px}
+.empty-state{padding:30px 16px}
+.dialog-body{padding:18px}.dialog-body>.heading{top:-18px;padding:12px 0;margin-top:-6px}
+.stats{padding:10px 12px;margin:12px 0;font-size:12px}th,td{padding:9px 10px}.dialog-footer{padding-top:12px}
+@supports(appearance:base-select){select{padding-right:10px}::picker(select){padding:4px;border-radius:8px}option{padding:7px 10px;font-size:13px}}
+@media(min-width:1000px){#targets{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:760px){main{padding:10px 14px 20px}header{padding:10px 14px}section{padding:14px}.brand{font-size:18px}nav{gap:18px}nav button{flex:0 0 auto;padding:8px 1px}.filters label{flex:0 1 auto}.filters select{width:150px}.grid{grid-template-columns:repeat(2,minmax(0,1fr))}#project-form{grid-template-columns:1fr}.form-grid{grid-template-columns:1fr}.dialog-body{padding:16px}.dialog-body>.heading{top:-16px}.list-meta{flex-direction:row;align-items:center}}
+@media(max-width:560px){.grid{grid-template-columns:1fr}.filters{gap:10px;flex-direction:row;flex-wrap:wrap}.filters label{flex:1;min-width:140px}.filters select{width:100%;min-width:0}.heading h1{font-size:20px}.list-meta{flex-wrap:wrap}nav{gap:18px}.card{padding:12px}.expiry-detail strong{font-size:12px}}

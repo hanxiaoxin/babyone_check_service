@@ -55,19 +55,21 @@ async function loadStatus() {
  $('counts').textContent = `共 ${data.total} 个目标 · 第 ${page} 页`;
  $('page-label').textContent = `${page} / ${Math.max(1,pages)}`;
  $('previous').disabled = page <= 1; $('next').disabled = page >= pages;
+ $('page-label').parentElement.hidden = pages <= 1;
  $('targets').replaceChildren();
  for (const item of data.data) {
   const t = item.target, r = item.latest; const card = el('article',undefined,'card target-card');
   const heading=el('div',undefined,'card-heading'); heading.append(el('h3',t.name),el('span',states[item.state] || item.state,'badge ' + item.state)); card.append(heading);
   const project = projects.find(p=>p.id===t.project_id);
   card.append(el('p',`${project?.name || '项目 ' + t.project_id} · ${t.kind === 'ssl' ? 'SSL 证书' : '服务可用性'}`),el('p',t.address,'target-address'));
-  if (project?.description) card.append(el('p',project.description));
-  card.append(el('p',`最近检测：${date(r?.checked_at)}\n延迟：${r ? r.latency_ms + ' ms' : '—'}`));
+  if (project?.description) { const description=el('p',project.description,'project-description'); description.title=project.description; card.append(description); }
+  const meta=el('div',undefined,'target-meta'); meta.append(el('span',`检测：${date(r?.checked_at)}`),el('span',`延迟 ${r ? r.latency_ms + ' ms' : '—'}`)); card.append(meta);
   if (r?.expires_at) { const expiry=el('div',undefined,'expiry'); expiry.dataset.expires=r.expires_at; expiry.append(el('p',`证书到期：${date(r.expires_at)}`),el('div',undefined,'expiry-detail')); card.append(expiry); updateExpiry(expiry); }
-  if (r?.error) card.append(el('p',r.error,'warning'));
+  if (r?.error) { const error=el('details',undefined,'target-error'); error.append(el('summary','查看错误详情'),el('p',r.error)); card.append(error); }
   const buttons = el('div',undefined,'actions');
   buttons.append(action('历史与统计',()=>openHistory(t)),action(t.enabled ? '暂停' : '恢复',async()=> { await api(`/targets/${t.id}`,'PATCH',{enabled:!t.enabled}); await loadStatus(); })); card.append(buttons); $('targets').append(card);
  }
+ $('targets').querySelectorAll('.target-address').forEach(n=>n.title=n.textContent);
  if (!data.data.length) $('targets').append(el('p','暂无检测目标，可在项目管理中添加。','empty-state'));
  $('updated-at').textContent = '更新于 ' + new Date().toLocaleTimeString();
 }
