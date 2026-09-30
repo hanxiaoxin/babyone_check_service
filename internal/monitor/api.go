@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"babyone_check_service/frontend"
 	"crypto/subtle"
 	"database/sql"
 	"github.com/gin-gonic/gin"
@@ -56,6 +57,9 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 		}
 		c.JSON(200, gin.H{"status": "ok"})
 	})
+	r.GET("/", func(c *gin.Context) { c.Redirect(http.StatusTemporaryRedirect, uiLocation(c)) })
+	r.GET("/ui", func(c *gin.Context) { c.Redirect(http.StatusTemporaryRedirect, uiLocation(c)) })
+	r.GET("/ui/*filepath", gin.WrapH(frontend.Handler()))
 	a := r.Group("/api/v1")
 	a.Use(func(c *gin.Context) {
 		provided := c.GetString("query_token")
@@ -449,4 +453,15 @@ func queryKind(c *gin.Context) (string, bool) {
 		return "", false
 	}
 	return values[0], true
+}
+
+func uiLocation(c *gin.Context) string {
+	q := c.Request.URL.Query()
+	if token := c.GetString("query_token"); token != "" {
+		q.Set("token", token)
+	}
+	if len(q) > 0 {
+		return "/ui/?" + q.Encode()
+	}
+	return "/ui/"
 }

@@ -381,3 +381,33 @@ func TestDescriptionMigration(t *testing.T) {
 		t.Fatal("repeated migration overwrote description")
 	}
 }
+
+func TestEmbeddedUI(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "ui.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	router := s.Router("test-token", "")
+	for path, content := range map[string]string{
+		"/ui/": "type=\"module\"", "/ui/app.js": "async function api", "/ui/style.css": "@media",
+	} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != 200 || !strings.Contains(w.Body.String(), content) {
+			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
+		}
+	}
+	for _, path := range []string{"/?token=a%2Bb", "/ui?token=a%2Bb"} {
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != "/ui/?token=a%2Bb" {
+			t.Fatalf("entry redirect: %d %s", w.Code, w.Header().Get("Location"))
+		}
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("GET", "/ui/embed.go", nil))
+	if w.Code != 404 {
+		t.Fatalf("source exposed: %d", w.Code)
+	}
+}
