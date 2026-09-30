@@ -56,3 +56,5 @@ make amd64
 git apply --check babyone_check.patch
 git apply babyone_check.patch
 ```
+
+证书卡片显示剩余天数和小时，展示等级独立于通知天数：超过 30 天为正常，30 天内提醒、7 天内警告、1 天内紧急，已过期标红。

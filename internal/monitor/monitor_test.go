@@ -437,7 +437,7 @@ func TestEmbeddedUI(t *testing.T) {
 	defer s.Close()
 	router := s.Router("test-token", "")
 	for path, content := range map[string]string{
-		"/ui/": "type=\"module\"", "/ui/app.js": "async function api", "/ui/style.css": "@media",
+		"/ui/": "type=\"module\"", "/ui/app.js": "async function api", "/ui/expiry.js": "export function certificateExpiry", "/ui/style.css": "@media",
 	} {
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, httptest.NewRequest("GET", path, nil))

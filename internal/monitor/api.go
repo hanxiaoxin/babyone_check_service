@@ -425,11 +425,6 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		fail(c, 500, "database error")
 		return
 	}
-	warningDays, err := s.sslWarningDays()
-	if err != nil {
-		fail(c, 500, "database error")
-		return
-	}
 	out := []gin.H{}
 	for _, t := range targets {
 		latest, e := s.Latest(t.ID)
@@ -450,7 +445,7 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		if latest != nil && latest.Expires > 0 {
 			remaining := latest.Expires - time.Now().Unix()
 			v["expires_in_seconds"] = remaining
-			v["expiry_warning"] = remaining <= int64(warningDays)*86400
+			v["expiry_warning"] = remaining <= 30*86400
 		}
 		out = append(out, v)
 	}

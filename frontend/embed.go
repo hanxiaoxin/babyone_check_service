@@ -6,7 +6,7 @@ import (
 	"net/http"
 )
 
-//go:embed index.html app.js style.css
+//go:embed index.html app.js style.css expiry.js
 var assets embed.FS
 
 // Handler serves the UI from the binary, independent of the working directory.

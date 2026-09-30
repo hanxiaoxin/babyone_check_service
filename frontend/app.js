@@ -1,3 +1,4 @@
+import { certificateExpiry } from './expiry.js';
 const $ = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; };
 const date = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : '—';
@@ -9,17 +10,17 @@ const url = new URL(location.href);
 const tokens = url.searchParams.getAll('token');
 url.searchParams.delete('token');
 history.replaceState(null, '', url.pathname + url.search + url.hash);
-function message(text = '', error = false) { $('message').textContent = text; $('message').className = error ? 'error' : ''; }
+function message(text = '', error = false) { $('message').textContent = text; $('message').className = error ? 'error' : 'success'; $('message').setAttribute('role', error ? 'alert' : 'status'); }
 function disconnect() { connected = false; token = ''; version++; historyVersion++; $('history').close(); $('workspace').hidden = true; $('login').hidden = false; $('logout').hidden = true; $('login-form').reset(); $('settings-form').reset(); $('targets').replaceChildren(); $('project-list').replaceChildren(); }
 async function api(path, method = 'GET', body) {
  const response = await fetch('/api/v1' + path, {method, headers:{Authorization:'Bearer ' + token, ...(body ? {'Content-Type':'application/json'} : {})}, ...(body ? {body:JSON.stringify(body)} : {}), cache:'no-store'});
- const data = await response.json();
+ let data; try { data = await response.json(); } catch { throw new Error(`服务响应异常 (${response.status})，请稍后重试`); }
  if (!response.ok) { if (response.status === 401) disconnect(); throw new Error(data.error || `请求失败 (${response.status})`); }
  return data;
 }
-async function run(task, button) { if (button) button.disabled = true; message(); try { await task(); } catch (e) { message(e.message, true); } finally { if (button) button.disabled = false; } }
+async function run(task, button) { const label=button?.textContent; if (button) { button.disabled=true; button.setAttribute('aria-busy','true'); button.textContent='处理中…'; } message(); try { await task(); } catch (e) { message(e.message, true); } finally { if (button) { button.disabled=false; button.removeAttribute('aria-busy'); button.textContent=label; } } }
 function action(text, task) { const button = el('button', text); button.type = 'button'; button.onclick = () => run(task, button); return button; }
-function tab(name) { for (const id of ['overview','projects','settings']) $(id).hidden = id !== name; document.querySelectorAll('[data-tab]').forEach(b => b.classList.toggle('active', b.dataset.tab === name)); }
+function tab(name) { $('message').textContent=''; for (const id of ['overview','projects','settings']) $(id).hidden = id !== name; document.querySelectorAll('[data-tab]').forEach(b => (b.classList.toggle('active', b.dataset.tab === name), b.setAttribute('aria-current', b.dataset.tab === name ? 'page' : 'false'))); }
 async function connect(value) {
  token = value;
  await loadProjects();
@@ -51,23 +52,24 @@ async function loadStatus() {
  const data = await api((pid ? `/projects/${pid}/status` : '/status') + '?' + params);
  if (current !== version || !connected) return;
  pages = data.total_pages;
- $('counts').textContent = `共 ${data.total} 个检测目标 · 当前页 ${data.data.length} 个`;
+ $('counts').textContent = `共 ${data.total} 个目标 · 第 ${page} 页`;
  $('page-label').textContent = `${page} / ${Math.max(1,pages)}`;
  $('previous').disabled = page <= 1; $('next').disabled = page >= pages;
  $('targets').replaceChildren();
  for (const item of data.data) {
-  const t = item.target, r = item.latest; const card = el('article',undefined,'card');
-  card.append(el('span',states[item.state] || item.state,'badge ' + item.state),el('h3',t.name));
+  const t = item.target, r = item.latest; const card = el('article',undefined,'card target-card');
+  const heading=el('div',undefined,'card-heading'); heading.append(el('h3',t.name),el('span',states[item.state] || item.state,'badge ' + item.state)); card.append(heading);
   const project = projects.find(p=>p.id===t.project_id);
-  card.append(el('p',`${project?.name || '项目 ' + t.project_id} · ${t.kind === 'ssl' ? 'SSL 证书' : '服务可用性'}`),el('p',t.address));
+  card.append(el('p',`${project?.name || '项目 ' + t.project_id} · ${t.kind === 'ssl' ? 'SSL 证书' : '服务可用性'}`),el('p',t.address,'target-address'));
   if (project?.description) card.append(el('p',project.description));
   card.append(el('p',`最近检测：${date(r?.checked_at)}\n延迟：${r ? r.latency_ms + ' ms' : '—'}`));
-  if (r?.expires_at) card.append(el('p',`证书到期：${date(r.expires_at)}${item.expiry_warning ? ' · 即将到期或已过期' : ''}`,item.expiry_warning ? 'warning' : ''));
+  if (r?.expires_at) { const expiry=el('div',undefined,'expiry'); expiry.dataset.expires=r.expires_at; expiry.append(el('p',`证书到期：${date(r.expires_at)}`),el('div',undefined,'expiry-detail')); card.append(expiry); updateExpiry(expiry); }
   if (r?.error) card.append(el('p',r.error,'warning'));
   const buttons = el('div',undefined,'actions');
   buttons.append(action('历史与统计',()=>openHistory(t)),action(t.enabled ? '暂停' : '恢复',async()=> { await api(`/targets/${t.id}`,'PATCH',{enabled:!t.enabled}); await loadStatus(); })); card.append(buttons); $('targets').append(card);
  }
- if (!data.data.length) $('targets').append(el('p','暂无检测目标，可在项目管理中添加。'));
+ if (!data.data.length) $('targets').append(el('p','暂无检测目标，可在项目管理中添加。','empty-state'));
+ $('updated-at').textContent = '更新于 ' + new Date().toLocaleTimeString();
 }
 async function loadSettings() {
  const s = await api('/settings'), f = $('settings-form').elements;
@@ -80,19 +82,19 @@ async function loadSettings() {
  $('smtp-password-status').textContent = s.smtp_password_set ? '已保存密码，留空保持原值' : '尚未设置密码';
 }
 
-async function openHistory(t) { historyTarget = t; $('history-title').textContent = t.name + ' · 检测历史'; if (!$('history').open) $('history').showModal(); await resetHistory(); }
+async function openHistory(t) { $('dialog-message').textContent=''; historyTarget = t; $('history-title').textContent = t.name + ' · 检测历史'; if (!$('history').open) $('history').showModal(); await resetHistory(); }
 async function resetHistory() {
  const current = ++historyVersion;
  cursor = null; $('history-rows').replaceChildren(); $('stats').textContent = '加载中…'; $('more-history').hidden = true;
  const to = Math.floor(Date.now()/1000)+1; historyWindow = new URLSearchParams({from:to-Number($('history-range').value),to});
- const stats = await api(`/targets/${historyTarget.id}/stats?${historyWindow}`);
+ let stats; try { stats=await api(`/targets/${historyTarget.id}/stats?${historyWindow}`); } catch(e) { if(current===historyVersion) { $('stats').textContent=''; $('dialog-message').textContent=e.message; } throw e; }
  if (current !== historyVersion || !$('history').open) return;
  $('stats').textContent = `${historyTarget.kind === 'ssl' ? 'TLS 校验成功率' : '样本可用率'}：${stats.availability_percent == null ? '—' : stats.availability_percent.toFixed(2)+'%'} · 样本 ${stats.samples} · 平均延迟 ${stats.avg_latency_ms == null ? '—' : stats.avg_latency_ms.toFixed(0)+' ms'}`;
  await loadHistory(current);
 }
 async function loadHistory(current = historyVersion) {
  const params = new URLSearchParams(historyWindow); params.set('limit',50); if (cursor) params.set('before_id',cursor);
- const data = await api(`/targets/${historyTarget.id}/history?${params}`);
+ let data; try { data=await api(`/targets/${historyTarget.id}/history?${params}`); $('dialog-message').textContent=''; } catch(e) { if(current===historyVersion) $('dialog-message').textContent=e.message; throw e; }
  if (current !== historyVersion || !$('history').open) return;
  for (const r of data.data) { const row = el('tr'); for (const value of [date(r.checked_at),r.ok?'成功':'失败',r.latency_ms+' ms',r.http_status || '—',date(r.expires_at),r.error || '—']) row.append(el('td',String(value))); $('history-rows').append(row); }
  if (!$('history-rows').children.length) { const row = el('tr'); const cell = el('td','此时间范围暂无检测记录'); cell.colSpan = 6; row.append(cell); $('history-rows').append(row); }
@@ -126,3 +128,18 @@ run(async()=>{
  if(!config.auth_required) { await connect(''); $('logout').hidden=true; }
  else if(tokens.length===1 && tokens[0]) await connect(tokens[0]);
 });
+
+function updateExpiry(node) {
+ const info=certificateExpiry(Number(node.dataset.expires));
+ node.className='expiry expiry-'+info.level;
+ const detail=node.querySelector('.expiry-detail');
+ detail.replaceChildren(el('strong',info.text),el('span',info.label,'expiry-label'));
+}
+setInterval(()=>document.querySelectorAll('[data-expires]').forEach(updateExpiry),60000);
+$('history').addEventListener('click',event=>{
+ if(event.target!==$('history')) return;
+ const r=$('history').getBoundingClientRect();
+ if(event.clientX<r.left || event.clientX>r.right || event.clientY<r.top || event.clientY>r.bottom) $('history').close();
+});
+$('history').addEventListener('close',()=>document.body.classList.remove('modal-open'));
+new MutationObserver(()=>document.body.classList.toggle('modal-open',$('history').open)).observe($('history'),{attributes:true,attributeFilter:['open']});
