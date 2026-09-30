@@ -52,7 +52,7 @@ func main() {
 	}
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
-		addr = "127.0.0.1:8080"
+		addr = "0.0.0.0:8080"
 	}
 	schedulerDone := make(chan struct{})
 	go func() { defer close(schedulerDone); s.Run(ctx) }()

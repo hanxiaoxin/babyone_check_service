@@ -13,7 +13,7 @@ cp .env.example .env
 go run .
 ```
 
-默认监听 `127.0.0.1:8080`，数据库 `monitor.db`。环境变量：
+默认监听 `0.0.0.0:8080`（所有 IPv4 网络接口），数据库 `monitor.db`。环境变量：
 
 - `API_TOKEN`：必填，所有 `/api/v1` 接口使用 `Authorization: Bearer <token>`。
 - `DB_PATH`：数据库路径，需要目录已存在且可写。
@@ -150,3 +150,5 @@ git apply --check /path/to/babyone_check_token.patch
 git apply /path/to/babyone_check_token.patch
 go test ./...
 ```
+
+已有 `.env` 也需要把 `LISTEN_ADDR` 改为 `0.0.0.0:8080` 并重启；否则它会覆盖代码默认值。其他设备使用 `http://服务器IP:8080` 访问，`0.0.0.0` 是监听地址。
