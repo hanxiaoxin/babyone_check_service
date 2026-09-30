@@ -195,7 +195,7 @@ func TestNotifications(t *testing.T) {
 		t.Fatal("dedup lost on reconfiguration")
 	}
 	cert := ts[3]
-	r = Result{TargetID: cert.ID, At: time.Now().Unix(), OK: true, Expires: time.Now().Add(5 * 24 * time.Hour).Unix()}
+	r = Result{TargetID: cert.ID, At: time.Now().Unix(), OK: true, Expires: time.Now().Add(12 * time.Hour).Unix()}
 	s.Notify(context.Background(), cert, r)
 	s.Notify(context.Background(), cert, r)
 	if calls != 5 {
@@ -456,5 +456,97 @@ func TestEmbeddedUI(t *testing.T) {
 	router.ServeHTTP(w, httptest.NewRequest("GET", "/ui/embed.go", nil))
 	if w.Code != 404 {
 		t.Fatalf("source exposed: %d", w.Code)
+	}
+}
+
+func TestWarningSettings(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "warning.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	// Simulate a database created before configurable warning days existed.
+	if _, err = s.db.Exec(`CREATE TABLE service_settings(id INTEGER PRIMARY KEY,auto_notify INTEGER NOT NULL); INSERT INTO service_settings VALUES(1,0)`); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ConfigureNotifications(SMTPConfig{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if s.notify.warningDays != 1 {
+		t.Fatal("default warning must be one day")
+	}
+	router := s.Router("token", "")
+	patch := func(body string) int {
+		r := httptest.NewRequest("PATCH", "/api/v1/settings", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer token")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return w.Code
+	}
+	for _, body := range []string{`{"ssl_warning_days":0}`, `{"ssl_warning_days":366}`, `{"ssl_warning_days":1.5}`} {
+		if patch(body) != 400 {
+			t.Fatal("invalid days accepted")
+		}
+	}
+	if patch(`{"ssl_warning_days":7}`) != 200 || s.notify.warningDays != 7 {
+		t.Fatal("warning update failed")
+	}
+	days, err := s.sslWarningDays()
+	if err != nil || days != 7 {
+		t.Fatal("status warning not synchronized")
+	}
+	now := time.Now().Unix()
+	target := Target{Kind: "ssl"}
+	result := Result{OK: true, Expires: now + 2*86400}
+	if notificationKey(target, result, 1) != "healthy" || !strings.HasPrefix(notificationKey(target, result, 7), "expiry:") {
+		t.Fatal("configured warning threshold ignored")
+	}
+	result.Expires = now + 12*3600
+	if !strings.HasPrefix(notificationKey(target, result, 1), "expiry:") {
+		t.Fatal("one day warning missing")
+	}
+	s.Close()
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ConfigureNotifications(SMTPConfig{}, false); err != nil || s.notify.warningDays != 7 {
+		t.Fatal("warning setting lost on restart")
+	}
+}
+
+func TestOptionalAuthentication(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "auth.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for _, enabled := range []bool{true, false} {
+		router := s.Router("token", "", enabled)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("GET", "/auth/config", nil))
+		var config struct {
+			Required bool `json:"auth_required"`
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &config) != nil || config.Required != enabled {
+			t.Fatal("auth configuration mismatch")
+		}
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/projects", nil))
+		expected := 200
+		if enabled {
+			expected = 401
+		}
+		if w.Code != expected {
+			t.Fatalf("auth enabled=%v status=%d", enabled, w.Code)
+		}
+	}
+	router := s.Router("", "", false)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/projects", strings.NewReader(`{"name":"no-token"}`)))
+	if w.Code != 201 {
+		t.Fatalf("disabled authentication did not allow writes: %d", w.Code)
 	}
 }

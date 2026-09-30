@@ -20,7 +20,11 @@ func id(c *gin.Context, key string) int64 {
 	}
 	return v
 }
-func (s *Service) Router(token, origin string) *gin.Engine {
+func (s *Service) Router(token, origin string, authentication ...bool) *gin.Engine {
+	authEnabled := true
+	if len(authentication) > 0 {
+		authEnabled = authentication[0]
+	}
 	r := gin.New()
 	// Remove the credential before Gin logging/recovery can inspect the URL.
 	r.Use(func(c *gin.Context) {
@@ -60,8 +64,14 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 	r.GET("/", func(c *gin.Context) { c.Redirect(http.StatusTemporaryRedirect, uiLocation(c)) })
 	r.GET("/ui", func(c *gin.Context) { c.Redirect(http.StatusTemporaryRedirect, uiLocation(c)) })
 	r.GET("/ui/*filepath", gin.WrapH(frontend.Handler()))
+	r.GET("/auth/config", func(c *gin.Context) { c.JSON(200, gin.H{"auth_required": authEnabled}) })
 	a := r.Group("/api/v1")
 	a.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
+		if !authEnabled {
+			c.Next()
+			return
+		}
 		provided := c.GetString("query_token")
 		if auth := c.GetHeader("Authorization"); auth != "" {
 			// A supplied header takes precedence; invalid headers cannot fall back to URL tokens.
@@ -75,7 +85,6 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 			fail(c, 401, "unauthorized")
 			return
 		}
-		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
 		c.Next()
 	})
 	s.configRoutes(a)
@@ -416,6 +425,11 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		fail(c, 500, "database error")
 		return
 	}
+	warningDays, err := s.sslWarningDays()
+	if err != nil {
+		fail(c, 500, "database error")
+		return
+	}
 	out := []gin.H{}
 	for _, t := range targets {
 		latest, e := s.Latest(t.ID)
@@ -436,7 +450,7 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		if latest != nil && latest.Expires > 0 {
 			remaining := latest.Expires - time.Now().Unix()
 			v["expires_in_seconds"] = remaining
-			v["expiry_warning"] = remaining < 30*86400
+			v["expiry_warning"] = remaining <= int64(warningDays)*86400
 		}
 		out = append(out, v)
 	}

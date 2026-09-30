@@ -2,6 +2,7 @@ const $ = id => document.getElementById(id);
 const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; };
 const date = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : '—';
 const states = {up:'正常', down:'异常', paused:'已暂停', unknown:'等待检测'};
+let connected = false;
 let token = '', projects = [], page = 1, pages = 0, version = 0;
 let historyTarget, historyWindow, cursor, historyVersion = 0;
 const url = new URL(location.href);
@@ -9,7 +10,7 @@ const tokens = url.searchParams.getAll('token');
 url.searchParams.delete('token');
 history.replaceState(null, '', url.pathname + url.search + url.hash);
 function message(text = '', error = false) { $('message').textContent = text; $('message').className = error ? 'error' : ''; }
-function disconnect() { token = ''; version++; historyVersion++; $('history').close(); $('workspace').hidden = true; $('login').hidden = false; $('logout').hidden = true; $('login-form').reset(); $('settings-form').reset(); $('targets').replaceChildren(); $('project-list').replaceChildren(); }
+function disconnect() { connected = false; token = ''; version++; historyVersion++; $('history').close(); $('workspace').hidden = true; $('login').hidden = false; $('logout').hidden = true; $('login-form').reset(); $('settings-form').reset(); $('targets').replaceChildren(); $('project-list').replaceChildren(); }
 async function api(path, method = 'GET', body) {
  const response = await fetch('/api/v1' + path, {method, headers:{Authorization:'Bearer ' + token, ...(body ? {'Content-Type':'application/json'} : {})}, ...(body ? {body:JSON.stringify(body)} : {}), cache:'no-store'});
  const data = await response.json();
@@ -22,7 +23,7 @@ function tab(name) { for (const id of ['overview','projects','settings']) $(id).
 async function connect(value) {
  token = value;
  await loadProjects();
- $('workspace').hidden = false; $('login').hidden = true; $('logout').hidden = false; $('login-form').reset(); tab('overview');
+ connected = true; $('workspace').hidden = false; $('login').hidden = true; $('logout').hidden = false; $('login-form').reset(); tab('overview');
  await loadStatus();
 }
 async function loadProjects() {
@@ -48,7 +49,7 @@ async function loadStatus() {
  const pid = $('project-filter').value; const params = new URLSearchParams({page,page_size:20});
  if ($('kind-filter').value) params.set('kind',$('kind-filter').value);
  const data = await api((pid ? `/projects/${pid}/status` : '/status') + '?' + params);
- if (current !== version || !token) return;
+ if (current !== version || !connected) return;
  pages = data.total_pages;
  $('counts').textContent = `共 ${data.total} 个检测目标 · 当前页 ${data.data.length} 个`;
  $('page-label').textContent = `${page} / ${Math.max(1,pages)}`;
@@ -75,6 +76,7 @@ async function loadSettings() {
  f.to.value = (s.smtp.to || []).join(', ');
  f.password.value = ''; f.clear_password.checked = false;
  f.auto_notify.checked = s.auto_notify;
+ f.ssl_warning_days.value = s.ssl_warning_days;
  $('smtp-password-status').textContent = s.smtp_password_set ? '已保存密码，留空保持原值' : '尚未设置密码';
 }
 
@@ -110,11 +112,17 @@ targetForm.onsubmit=e=>{e.preventDefault();run(async()=>{const form=e.target, f=
 $('settings-form').onsubmit=e=>{e.preventDefault();run(async()=>{
  const f=e.target.elements;
  const smtp={host:f.host.value.trim(),port:Number(f.port.value),tls_mode:f.tls_mode.value,username:f.username.value.trim(),password:f.password.value,from:f.from.value.trim(),to:f.to.value.split(/[,，\n]/).map(v=>v.trim()).filter(Boolean)};
- await api('/settings','PATCH',{auto_notify:f.auto_notify.checked,smtp,clear_smtp_password:f.clear_password.checked});
+ await api('/settings','PATCH',{auto_notify:f.auto_notify.checked,ssl_warning_days:Number(f.ssl_warning_days.value),smtp,clear_smtp_password:f.clear_password.checked});
  f.password.value=''; await loadSettings(); message('通知设置已保存，立即生效');
 },e.submitter);};
 $('close-history').onclick=()=>{historyVersion++;$('history').close();};
 $('history').addEventListener('close',()=>historyVersion++);
 $('history-range').onchange=()=>run(resetHistory);
 $('more-history').onclick=()=>run(()=>loadHistory(),$('more-history'));
-if(tokens.length===1 && tokens[0]) run(()=>connect(tokens[0]));
+run(async()=>{
+ const response = await fetch('/auth/config', {cache:'no-store'});
+ if(!response.ok) throw new Error('无法读取认证配置');
+ const config = await response.json();
+ if(!config.auth_required) { await connect(''); $('logout').hidden=true; }
+ else if(tokens.length===1 && tokens[0]) await connect(tokens[0]);
+});

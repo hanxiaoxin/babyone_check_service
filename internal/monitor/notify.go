@@ -27,9 +27,10 @@ type SMTPConfig struct {
 	TLSMode  string   `json:"tls_mode"`
 }
 type notifier struct {
-	config SMTPConfig
-	mu     sync.Mutex
-	send   func(context.Context, string, string) error
+	config      SMTPConfig
+	warningDays int
+	mu          sync.Mutex
+	send        func(context.Context, string, string) error
 }
 
 func (c SMTPConfig) Validate() error {
@@ -137,6 +138,8 @@ func (s *Service) ConfigureNotifications(c SMTPConfig, initial bool) error {
 	}
 	s.notify = &notifier{config: c, send: c.Send}
 	_, e := s.db.Exec(`CREATE TABLE IF NOT EXISTS service_settings(id INTEGER PRIMARY KEY CHECK(id=1),auto_notify INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS ssl_warning_settings(id INTEGER PRIMARY KEY CHECK(id=1),days INTEGER NOT NULL CHECK(days BETWEEN 1 AND 365));
+ INSERT OR IGNORE INTO ssl_warning_settings(id,days)VALUES(1,1);
  CREATE TABLE IF NOT EXISTS smtp_settings(id INTEGER PRIMARY KEY CHECK(id=1),config TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS notification_state(target_id INTEGER PRIMARY KEY REFERENCES targets(id),state_key TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS notification_attempts(id INTEGER PRIMARY KEY,target_id INTEGER NOT NULL,created_at INTEGER NOT NULL,state_key TEXT NOT NULL,sent INTEGER NOT NULL);`)
@@ -166,6 +169,9 @@ func (s *Service) ConfigureNotifications(c SMTPConfig, initial bool) error {
 	if c.TLSMode == "" {
 		c.TLSMode = "starttls"
 	}
+	if err = s.db.QueryRow(`SELECT days FROM ssl_warning_settings WHERE id=1`).Scan(&s.notify.warningDays); err != nil {
+		return err
+	}
 	s.notify.config, s.notify.send = c, c.Send
 	enabled, err := s.autoNotify()
 	if err != nil {
@@ -183,11 +189,11 @@ func (s *Service) autoNotify() (bool, error) {
 	e := s.db.QueryRow(`SELECT auto_notify FROM service_settings WHERE id=1`).Scan(&on)
 	return on, e
 }
-func notificationKey(t Target, r Result) string {
+func notificationKey(t Target, r Result, warningDays int) string {
 	if !r.OK {
 		return "down"
 	}
-	if t.Kind == "ssl" && r.Expires > 0 && r.Expires-time.Now().Unix() < 30*86400 {
+	if t.Kind == "ssl" && r.Expires > 0 && r.Expires-time.Now().Unix() <= int64(warningDays)*86400 {
 		return fmt.Sprintf("expiry:%d", r.Expires)
 	}
 	return "healthy"
@@ -202,7 +208,7 @@ func (s *Service) Notify(ctx context.Context, t Target, r Result) error {
 	if e != nil || !on {
 		return e
 	}
-	key := notificationKey(t, r)
+	key := notificationKey(t, r, s.notify.warningDays)
 	var prior string
 	e = s.db.QueryRow(`SELECT state_key FROM notification_state WHERE target_id=?`, t.ID).Scan(&prior)
 	if e != nil && !errors.Is(e, sql.ErrNoRows) {
@@ -241,7 +247,7 @@ func (s *Service) settingsResponse(on bool) gin.H {
 		cfg.To = []string{}
 	}
 	return gin.H{"auto_notify": on, "smtp_configured": s.notify.config.Validate() == nil,
-		"ssl_warning_days": 30, "smtp": cfg, "smtp_password_set": hasPassword}
+		"ssl_warning_days": s.notify.warningDays, "smtp": cfg, "smtp_password_set": hasPassword}
 }
 func (s *Service) configRoutes(a *gin.RouterGroup) {
 	a.GET("/settings", func(c *gin.Context) {
@@ -264,12 +270,13 @@ func (s *Service) configRoutes(a *gin.RouterGroup) {
 			return
 		}
 		var b struct {
+			WarningDays   *int        `json:"ssl_warning_days"`
 			AutoNotify    *bool       `json:"auto_notify"`
 			SMTP          *SMTPConfig `json:"smtp"`
 			ClearPassword bool        `json:"clear_smtp_password"`
 		}
-		if c.ShouldBindJSON(&b) != nil || (b.AutoNotify == nil && b.SMTP == nil && !b.ClearPassword) {
-			fail(c, 400, "auto_notify or smtp settings required")
+		if c.ShouldBindJSON(&b) != nil || (b.WarningDays == nil && b.AutoNotify == nil && b.SMTP == nil && !b.ClearPassword) {
+			fail(c, 400, "notification settings required")
 			return
 		}
 		s.notify.mu.Lock()
@@ -278,6 +285,14 @@ func (s *Service) configRoutes(a *gin.RouterGroup) {
 		if err != nil {
 			fail(c, 500, "database error")
 			return
+		}
+		days := s.notify.warningDays
+		if b.WarningDays != nil {
+			days = *b.WarningDays
+			if days < 1 || days > 365 {
+				fail(c, 400, "ssl_warning_days must be 1..365")
+				return
+			}
 		}
 		if b.AutoNotify != nil {
 			on = *b.AutoNotify
@@ -320,13 +335,27 @@ func (s *Service) configRoutes(a *gin.RouterGroup) {
 			_, err = tx.Exec(`UPDATE smtp_settings SET config=? WHERE id=1`, string(raw))
 		}
 		if err == nil {
+			_, err = tx.Exec(`UPDATE ssl_warning_settings SET days=? WHERE id=1`, days)
+		}
+		if err == nil {
 			err = tx.Commit()
 		}
 		if err != nil {
 			fail(c, 500, "database error")
 			return
 		}
+		s.notify.warningDays = days
 		s.notify.config, s.notify.send = cfg, cfg.Send
 		c.JSON(200, s.settingsResponse(on))
 	})
+}
+
+// Status pages also work before notifications are configured (e.g. API tests).
+func (s *Service) sslWarningDays() (int, error) {
+	if s.notify == nil {
+		return 1, nil
+	}
+	var days int
+	err := s.db.QueryRow(`SELECT days FROM ssl_warning_settings WHERE id=1`).Scan(&days)
+	return days, err
 }
