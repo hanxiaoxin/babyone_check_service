@@ -6,7 +6,10 @@ import (
 	"time"
 )
 
-type Service struct{ db *sql.DB }
+type Service struct {
+	db     *sql.DB
+	notify *notifier
+}
 type Project struct {
 	ID   int64  `json:"id"`
 	Name string `json:"name"`
@@ -48,7 +51,7 @@ func Open(path string) (*Service, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Service{db}, nil
+	return &Service{db: db}, nil
 }
 func (s *Service) Close() error { return s.db.Close() }
 func (s *Service) Targets(project int64) ([]Target, error) {

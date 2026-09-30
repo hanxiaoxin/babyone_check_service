@@ -50,6 +50,7 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
 		c.Next()
 	})
+	s.configRoutes(a)
 	a.GET("/projects", func(c *gin.Context) {
 		rows, e := s.db.Query(`SELECT id,name FROM projects ORDER BY id`)
 		if e != nil {

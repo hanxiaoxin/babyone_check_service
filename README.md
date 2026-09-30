@@ -8,7 +8,9 @@ Go + Gin + SQLite 网站监测后端，供独立前端调用。单进程部署�
 
 ```bash
 go mod download
-API_TOKEN='replace-with-a-long-random-token' go run .
+cp .env.example .env
+# 编辑 .env 后启动
+go run .
 ```
 
 默认监听 `127.0.0.1:8080`，数据库 `monitor.db`。环境变量：
@@ -56,7 +58,7 @@ curl -H 'Authorization: Bearer your-token' 'http://127.0.0.1:8080/api/v1/targets
 
 `availability_percent = successful_samples / total_samples * 100`，没有样本返回 null。SSL 的成功率表示 TLS 校验成功率，不是业务服务可用率。暂停/调度停机没有样本，不自动算成功或失败；这是样本可用率，不是按实际故障持续时间计算的 SLA。
 
-最新结果超过两倍检测间隔加超时时间则状态 unknown。调度启动后立即检测，最多 8 个并发探测，每批完成后调度下一批；目标多时可能延迟，不保证硬实时。历史记录永久保存，后续可加入保留策略、日汇总、告警、连续失败阈值和多探测点。此版未实现事故管理或计划维护。
+最新结果超过两倍检测间隔加超时时间则状态 unknown。调度启动后立即检测，最多 8 个并发探测，每批完成后调度下一批；目标多时可能延迟，不保证硬实时。历史记录永久保存，后续可加入保留策略、日汇总、连续失败阈值和多探测点。此版未实现事故管理或计划维护。
 
 所有管理和读取 API 共用一个服务端 token，不要把管理 token 写入公开前端 JS。建议前端后端代理，或后续增加只读公开状态 API 和独立写权限。检测目标由可信管理员维护，可访问内网，不能开放给不可信用户任意添加 URL。跨域 Origin 不是认证。
 
@@ -79,3 +81,52 @@ make armv7
 `GET /api/v1/status?page=1&page_size=20` 查询所有项目下的检测目标。
 `GET /api/v1/projects/1/status?page=1&page_size=20` 查询指定项目下的检测目标。
 两者都按目标 ID 升序，默认 page=1、page_size=20，每页最大 100。返回 `data`、`page`、`page_size`、`total`、`total_pages`，每项保留 `target`（含 project_id）、`state`、`latest` 及证书预警字段。超出最后一页返回空数组；非法分页参数返回 400。分页单位是检测目标。
+
+## .env 和邮件通知
+
+```bash
+cp .env.example .env
+# 编辑 .env：至少修改 API_TOKEN，邮件需要填写 SMTP_*。
+go run .
+```
+
+Go 程序启动时通过 godotenv 加载当前工作目录的 `.env`；操作系统环境变量优先。`.env.example` 是模板，不自动加载；真实 `.env` 已被 Git 忽略，不要提交密码或授权码。修改 `.env` 后重启服务。
+
+配置分为两层：启动配置（API_TOKEN、数据库、监听、SMTP 密钥）来自环境变量/`.env`；运行配置（自动通知开关）保存在 SQLite，服务重启后保留，API 不返回 SMTP 密码或 Token。
+
+SMTP 支持 587 STARTTLS 和 465 隐式 TLS，必须验证服务器证书。`SMTP_TO` 支持逗号分隔的多个邮箱。某些提供商需要 SMTP 授权码而不是登录密码。未配置 SMTP 时服务可以正常启动，但无法开启通知。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| GET | `/api/v1/settings` | 返回 auto_notify、smtp_configured、ssl_warning_days |
+| PATCH | `/api/v1/settings` | 持久化修改自动通知开关 |
+
+```bash
+curl -H 'Authorization: Bearer your-token' http://127.0.0.1:8080/api/v1/settings
+curl -X PATCH -H 'Authorization: Bearer your-token' -H 'Content-Type: application/json' \
+  -d '{"auto_notify":true}' http://127.0.0.1:8080/api/v1/settings
+```
+
+`AUTO_NOTIFY=false` 是**新数据库的初始值**；后续以数据库保存的设置为准，避免重启覆盖前端设置。已开启通知的数据库若缺少有效 SMTP 配置，启动会报错，防止误以为通知正常。
+
+通知规则：首次发现不可用时告警；恢复正常时发送恢复通知；证书剩余不足 30 天时预警，同一证书只提醒一次，证书更换后重新判定。首次正常检测不发邮件。相同故障状态不会在每次检测时重复发送。状态和发送尝试存在 SQLite，重启后仍可去重。发送失败不更新已通知状态，下次检测重试；SMTP 超时 10 秒。通知关闭期间不发送；重新开启后在下次检测评估当前状态。
+
+通知发送与检测运行在同一进程，串行发送，未实现独立消息队列、限流、每日提醒或通知日志查询 API。邮件依赖 SMTP 接受，不能保证最终进收件箱；在 SMTP 接受但进程未保存状态时崩溃，可能重复通知。此版健康判断仍基于 HTTP 状态码。
+
+## 应用补丁
+
+本次补丁仅包含邮件通知及服务配置的增量修改，基于最新远端提交 `ca15583b6851098a523ec204f0d8560c1bf5e6c9`（feat: add monit）。请在干净的项目根目录使用。
+
+```bash
+git pull --ff-only
+git status --short
+git apply --check /path/to/babyone_check.patch
+git apply /path/to/babyone_check.patch
+go mod download
+go test ./...
+cp .env.example .env
+# 填写 .env 后启动。
+go run .
+```
+
+`git apply` 一次应用所有文件，不会自动提交。确认修改后执行 `git add .`、`git commit`、`git push`。Windows 下可在 Git Bash 或 PowerShell 中执行，将路径替换为实际补丁路径。如果 check 提示冲突，保留本地修改并提供最新仓库或差异，以便生成基于当前版本的增量补丁；不要忽略错误或强制覆盖。

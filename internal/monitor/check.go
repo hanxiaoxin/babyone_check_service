@@ -126,6 +126,8 @@ func (s *Service) Run(ctx context.Context) {
 					if ctx.Err() == nil {
 						if err := s.Save(r); err != nil {
 							log.Printf("save result: %v", err)
+						} else if err := s.Notify(ctx, t, r); err != nil {
+							log.Printf("notify target %d: %v", t.ID, err)
 						}
 					}
 				}(t)

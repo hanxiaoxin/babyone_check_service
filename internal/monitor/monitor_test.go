@@ -3,9 +3,11 @@ package monitor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -128,5 +130,128 @@ func TestStatusPagination(t *testing.T) {
 		if c, _ := get("/api/v1/status?" + q); c != 400 {
 			t.Fatalf("invalid query accepted: %s", q)
 		}
+	}
+}
+
+func TestNotifications(t *testing.T) {
+	s, e := Open(filepath.Join(t.TempDir(), "notify.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	s.Seed()
+	cfg := SMTPConfig{Host: "smtp.example.com", Port: 587, TLSMode: "starttls", From: "from@example.com", To: []string{"to@example.com"}}
+	if e = s.ConfigureNotifications(cfg, true); e != nil {
+		t.Fatal(e)
+	}
+	calls := 0
+	shouldFail := false
+	s.notify.send = func(context.Context, string, string) error {
+		calls++
+		if shouldFail {
+			return fmt.Errorf("failed")
+		}
+		return nil
+	}
+	ts, _ := s.Targets(0)
+	target := ts[0]
+	r := Result{TargetID: target.ID, At: time.Now().Unix(), OK: true}
+	if e = s.Notify(context.Background(), target, r); e != nil {
+		t.Fatal(e)
+	}
+	if calls != 0 {
+		t.Fatal("initial healthy mail")
+	}
+	r.OK = false
+	s.Notify(context.Background(), target, r)
+	s.Notify(context.Background(), target, r)
+	if calls != 1 {
+		t.Fatal("duplicate failure notification")
+	}
+	r.OK = true
+	s.Notify(context.Background(), target, r)
+	if calls != 2 {
+		t.Fatal("missing recovery")
+	}
+	shouldFail = true
+	r.OK = false
+	s.Notify(context.Background(), target, r)
+	shouldFail = false
+	s.Notify(context.Background(), target, r)
+	if calls != 4 {
+		t.Fatal("failed send not retried")
+	}
+	if e = s.ConfigureNotifications(cfg, false); e != nil {
+		t.Fatal(e)
+	}
+	enabled, _ := s.autoNotify()
+	if !enabled {
+		t.Fatal("restart overwrote persisted setting")
+	}
+	s.notify.send = func(context.Context, string, string) error { calls++; return nil }
+	s.Notify(context.Background(), target, r)
+	if calls != 4 {
+		t.Fatal("dedup lost on reconfiguration")
+	}
+	cert := ts[3]
+	r = Result{TargetID: cert.ID, At: time.Now().Unix(), OK: true, Expires: time.Now().Add(5 * 24 * time.Hour).Unix()}
+	s.Notify(context.Background(), cert, r)
+	s.Notify(context.Background(), cert, r)
+	if calls != 5 {
+		t.Fatal("SSL warning dedup")
+	}
+	s.db.Exec(`UPDATE service_settings SET auto_notify=0`)
+	r.OK = false
+	s.Notify(context.Background(), cert, r)
+	if calls != 5 {
+		t.Fatal("disabled notifications sent")
+	}
+}
+func TestSettingsAPI(t *testing.T) {
+	s, e := Open(filepath.Join(t.TempDir(), "settings.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	if e = s.ConfigureNotifications(SMTPConfig{TLSMode: "starttls", Port: 587}, false); e != nil {
+		t.Fatal(e)
+	}
+	router := s.Router("token", "")
+	r := httptest.NewRequest("PATCH", "/api/v1/settings", strings.NewReader(`{"auto_notify":true}`))
+	r.Header.Set("Authorization", "Bearer token")
+	r.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+	if w.Code != 400 {
+		t.Fatalf("missing SMTP enabled: %d", w.Code)
+	}
+	r = httptest.NewRequest("GET", "/api/v1/settings", nil)
+	r.Header.Set("Authorization", "Bearer token")
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, r)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "password") {
+		t.Fatal(w.Body.String())
+	}
+}
+
+func TestSMTPEnvironment(t *testing.T) {
+	t.Setenv("SMTP_HOST", "smtp.example.com")
+	t.Setenv("SMTP_PORT", "465")
+	t.Setenv("SMTP_TLS_MODE", "tls")
+	t.Setenv("SMTP_FROM", "from@example.com")
+	t.Setenv("SMTP_TO", "a@example.com, b@example.com")
+	t.Setenv("SMTP_USERNAME", "user")
+	t.Setenv("SMTP_PASSWORD", "secret")
+	c, e := SMTPFromEnv()
+	if e != nil || c.Port != 465 || len(c.To) != 2 || c.Validate() != nil {
+		t.Fatalf("SMTP parse: %+v %v", c, e)
+	}
+	c.From = "from@example.com\r\nBcc: bad@example.com"
+	if c.Validate() == nil {
+		t.Fatal("header injection accepted")
+	}
+	t.Setenv("SMTP_PORT", "invalid")
+	if _, e = SMTPFromEnv(); e == nil {
+		t.Fatal("bad port accepted")
 	}
 }
