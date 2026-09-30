@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -278,5 +279,105 @@ func TestQueryToken(t *testing.T) {
 		if strings.Contains(r.URL.RawQuery, "token") {
 			t.Fatal("token retained for logger")
 		}
+	}
+}
+
+func TestKindFiltersAndProjectDescription(t *testing.T) {
+	s, e := Open(filepath.Join(t.TempDir(), "filters.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	if e = s.Seed(); e != nil {
+		t.Fatal(e)
+	}
+	router := s.Router("token", "")
+	request := func(method, path, body string) (int, map[string]any) {
+		r := httptest.NewRequest(method, path, strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer token")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		var b map[string]any
+		json.Unmarshal(w.Body.Bytes(), &b)
+		return w.Code, b
+	}
+	code, b := request("GET", "/api/v1/status?kind=ssl&page_size=2", "")
+	if code != 200 || b["total"] != float64(3) || b["total_pages"] != float64(2) || len(b["data"].([]any)) != 2 {
+		t.Fatalf("filtered pages: %d %+v", code, b)
+	}
+	for _, v := range b["data"].([]any) {
+		if v.(map[string]any)["target"].(map[string]any)["kind"] != "ssl" {
+			t.Fatal("wrong kind")
+		}
+	}
+	code, b = request("GET", "/api/v1/projects/1/status?kind=ssl", "")
+	if code != 200 || b["total"] != float64(0) {
+		t.Fatal("project and kind not combined")
+	}
+	code, b = request("GET", "/api/v1/projects/4/targets?kind=ssl", "")
+	if code != 200 || len(b["data"].([]any)) != 3 {
+		t.Fatal("targets filter")
+	}
+	for _, path := range []string{"/api/v1/status?kind=nope", "/api/v1/status?kind=", "/api/v1/projects/1/targets?kind=http&kind=ssl"} {
+		if code, _ = request("GET", path, ""); code != 400 {
+			t.Fatalf("invalid kind: %s", path)
+		}
+	}
+	code, b = request("POST", "/api/v1/projects", `{"name":"new","description":"项目描述"}`)
+	if code != 201 || b["description"] != "项目描述" {
+		t.Fatalf("create: %+v", b)
+	}
+	pid := int(b["id"].(float64))
+	code, b = request("PATCH", fmt.Sprintf("/api/v1/projects/%d", pid), `{"description":"updated"}`)
+	if code != 200 || b["description"] != "updated" {
+		t.Fatal("description patch")
+	}
+	code, b = request("GET", "/api/v1/projects", "")
+	found := false
+	for _, v := range b["data"].([]any) {
+		p := v.(map[string]any)
+		if p["name"] == "new" && p["description"] == "updated" {
+			found = true
+		}
+	}
+	if code != 200 || !found {
+		t.Fatal("description not returned")
+	}
+	if code, _ = request("PATCH", "/api/v1/projects/99999", `{"description":"x"}`); code != 404 {
+		t.Fatal("missing project")
+	}
+	if code, _ = request("PATCH", fmt.Sprintf("/api/v1/projects/%d", pid), `{"description":""}`); code != 200 {
+		t.Fatal("cannot clear description")
+	}
+}
+func TestDescriptionMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, e := sql.Open("sqlite", path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	_, e = db.Exec(`CREATE TABLE projects(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE);INSERT INTO projects(name)VALUES('existing');`)
+	db.Close()
+	if e != nil {
+		t.Fatal(e)
+	}
+	s, e := Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	var desc string
+	if e = s.db.QueryRow(`SELECT description FROM projects WHERE name='existing'`).Scan(&desc); e != nil || desc != "" {
+		t.Fatal("migration lost old project")
+	}
+	s.db.Exec(`UPDATE projects SET description='keep'`)
+	s.Close()
+	s, e = Open(path)
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	if e = s.db.QueryRow(`SELECT description FROM projects WHERE name='existing'`).Scan(&desc); e != nil || desc != "keep" {
+		t.Fatal("repeated migration overwrote description")
 	}
 }

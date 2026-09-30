@@ -11,8 +11,9 @@ type Service struct {
 	notify *notifier
 }
 type Project struct {
-	ID   int64  `json:"id"`
-	Name string `json:"name"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 type Target struct {
 	ID        int64  `json:"id"`
@@ -51,15 +52,60 @@ func Open(path string) (*Service, error) {
 		db.Close()
 		return nil, err
 	}
+	// Existing installations receive an additive migration without losing data.
+	rows, err := db.Query(`PRAGMA table_info(projects)`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	hasDescription := false
+	for rows.Next() {
+		var cid, notnull, pk int
+		var name, typ string
+		var def sql.NullString
+		if err = rows.Scan(&cid, &name, &typ, &notnull, &def, &pk); err != nil {
+			rows.Close()
+			db.Close()
+			return nil, err
+		}
+		if name == "description" {
+			hasDescription = true
+		}
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	if !hasDescription {
+		if _, err = db.Exec(`ALTER TABLE projects ADD COLUMN description TEXT NOT NULL DEFAULT ''`); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
+	_, err = db.Exec(`CREATE INDEX IF NOT EXISTS targets_kind_id ON targets(kind,id); CREATE INDEX IF NOT EXISTS targets_project_kind_id ON targets(project_id,kind,id);`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Service{db: db}, nil
 }
 func (s *Service) Close() error { return s.db.Close() }
-func (s *Service) Targets(project int64) ([]Target, error) {
+func (s *Service) Targets(project int64, kinds ...string) ([]Target, error) {
 	q := `SELECT id,project_id,name,kind,address,interval_seconds,timeout_seconds,expected_status,enabled FROM targets`
 	args := []any{}
 	if project > 0 {
 		q += ` WHERE project_id=?`
 		args = append(args, project)
+	}
+	if len(kinds) > 0 && kinds[0] != "" {
+		if project > 0 {
+			q += ` AND kind=?`
+		} else {
+			q += ` WHERE kind=?`
+		}
+		args = append(args, kinds[0])
 	}
 	q += ` ORDER BY id`
 	rows, err := s.db.Query(q, args...)

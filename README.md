@@ -152,3 +152,27 @@ go test ./...
 ```
 
 已有 `.env` 也需要把 `LISTEN_ADDR` 改为 `0.0.0.0:8080` 并重启；否则它会覆盖代码默认值。其他设备使用 `http://服务器IP:8080` 访问，`0.0.0.0` 是监听地址。
+
+## 检测分类筛选和项目描述
+
+以下列表支持可选 `kind=http`（服务可用性）或 `kind=ssl`（证书），不传查询全部；非法或重复 kind 返回 400：
+
+- `/api/v1/status?kind=ssl&page=1&page_size=20`
+- `/api/v1/projects/1/status?kind=http&page=1&page_size=20`
+- `/api/v1/projects/1/targets?kind=http`
+
+状态列表的 total 和 total_pages 按筛选后的结果计算，原有分页参数保留。项目目标列表保留原有 data 数组格式。
+
+项目新增 `description` 字段，默认空字符串，最多 2000 UTF-8 字节。`GET /api/v1/projects` 返回描述，`POST /api/v1/projects` 支持 `{"name":"my-project","description":"项目介绍"}`。
+`PATCH /api/v1/projects/1` 使用 `{"description":"新的介绍"}` 更新，传空字符串清空描述。旧 SQLite 启动时自动增加字段，已有项目及检测历史保留，无需删除数据库。
+
+本次补丁基于 `5f6fa67`，文件名统一 `babyone_check.patch`：
+
+```bash
+git pull --ff-only
+git apply --check babyone_check.patch
+git apply babyone_check.patch
+go test ./...
+```
+
+应用后重新构建并重启服务以执行数据库迁移。

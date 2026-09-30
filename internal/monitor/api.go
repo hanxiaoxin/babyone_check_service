@@ -76,7 +76,7 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 	})
 	s.configRoutes(a)
 	a.GET("/projects", func(c *gin.Context) {
-		rows, e := s.db.Query(`SELECT id,name FROM projects ORDER BY id`)
+		rows, e := s.db.Query(`SELECT id,name,description FROM projects ORDER BY id`)
 		if e != nil {
 			fail(c, 500, "database error")
 			return
@@ -85,7 +85,7 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 		out := []Project{}
 		for rows.Next() {
 			var p Project
-			if rows.Scan(&p.ID, &p.Name) != nil {
+			if rows.Scan(&p.ID, &p.Name, &p.Description) != nil {
 				fail(c, 500, "database error")
 				return
 			}
@@ -99,11 +99,11 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 	})
 	a.POST("/projects", func(c *gin.Context) {
 		var p Project
-		if c.ShouldBindJSON(&p) != nil || p.Name == "" || len(p.Name) > 100 {
-			fail(c, 400, "name required, max 100 characters")
+		if c.ShouldBindJSON(&p) != nil || p.Name == "" || len(p.Name) > 100 || len(p.Description) > 2000 {
+			fail(c, 400, "name required, max 100 bytes; description max 2000 bytes")
 			return
 		}
-		res, e := s.db.Exec(`INSERT INTO projects(name)VALUES(?)`, p.Name)
+		res, e := s.db.Exec(`INSERT INTO projects(name,description)VALUES(?,?)`, p.Name, p.Description)
 		if e != nil {
 			fail(c, 409, "could not create project; name must be unique")
 			return
@@ -111,12 +111,45 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 		p.ID, _ = res.LastInsertId()
 		c.JSON(201, p)
 	})
+	a.PATCH("/projects/:project", func(c *gin.Context) {
+		pid := id(c, "project")
+		if pid == 0 {
+			return
+		}
+		var b struct {
+			Description *string `json:"description"`
+		}
+		if c.ShouldBindJSON(&b) != nil || b.Description == nil || len(*b.Description) > 2000 {
+			fail(c, 400, "description required, max 2000 bytes")
+			return
+		}
+		res, e := s.db.Exec(`UPDATE projects SET description=? WHERE id=?`, *b.Description, pid)
+		if e != nil {
+			fail(c, 500, "database error")
+			return
+		}
+		n, _ := res.RowsAffected()
+		if n == 0 {
+			fail(c, 404, "project not found")
+			return
+		}
+		var p Project
+		if e = s.db.QueryRow(`SELECT id,name,description FROM projects WHERE id=?`, pid).Scan(&p.ID, &p.Name, &p.Description); e != nil {
+			fail(c, 500, "database error")
+			return
+		}
+		c.JSON(200, p)
+	})
 	a.GET("/projects/:project/targets", func(c *gin.Context) {
 		p := id(c, "project")
 		if p == 0 {
 			return
 		}
-		ts, e := s.Targets(p)
+		kind, ok := queryKind(c)
+		if !ok {
+			return
+		}
+		ts, e := s.Targets(p, kind)
 		if e != nil {
 			fail(c, 500, "database error")
 			return
@@ -324,11 +357,23 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		fail(c, 400, "page_size must be 1..100; page must be 1..1000000000")
 		return
 	}
+	kind, ok := queryKind(c)
+	if !ok {
+		return
+	}
 	where := ""
 	args := []any{}
 	if project > 0 {
 		where = " WHERE project_id=?"
 		args = append(args, project)
+	}
+	if kind != "" {
+		if where == "" {
+			where = " WHERE kind=?"
+		} else {
+			where += " AND kind=?"
+		}
+		args = append(args, kind)
 	}
 	tx, err := s.db.BeginTx(c.Request.Context(), nil)
 	if err != nil {
@@ -392,4 +437,16 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		out = append(out, v)
 	}
 	c.JSON(200, gin.H{"data": out, "page": page, "page_size": size, "total": total, "total_pages": (total + size - 1) / size})
+}
+
+func queryKind(c *gin.Context) (string, bool) {
+	values, exists := c.Request.URL.Query()["kind"]
+	if !exists {
+		return "", true
+	}
+	if len(values) != 1 || (values[0] != "http" && values[0] != "ssl") {
+		fail(c, 400, "kind must be http or ssl; omit it to query all")
+		return "", false
+	}
+	return values[0], true
 }
