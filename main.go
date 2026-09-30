@@ -4,7 +4,6 @@ import (
 	"babyone_check_service/internal/monitor"
 	"context"
 	"errors"
-	"github.com/joho/godotenv"
 	"log"
 	"net/http"
 	"os"
@@ -12,6 +11,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"github.com/joho/godotenv"
 )
 
 func main() {
@@ -48,7 +49,7 @@ func main() {
 	}
 	addr := os.Getenv("LISTEN_ADDR")
 	if addr == "" {
-		addr = "0.0.0.0:8080"
+		addr = "0.0.0.0:8081"
 	}
 	schedulerDone := make(chan struct{})
 	go func() { defer close(schedulerDone); s.Run(ctx) }()
