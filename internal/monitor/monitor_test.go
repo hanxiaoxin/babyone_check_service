@@ -255,3 +255,28 @@ func TestSMTPEnvironment(t *testing.T) {
 		t.Fatal("bad port accepted")
 	}
 }
+
+func TestQueryToken(t *testing.T) {
+	s, e := Open(filepath.Join(t.TempDir(), "token.db"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	defer s.Close()
+	router := s.Router("secret-value", "*")
+	cases := []struct {
+		query, auth string
+		want        int
+	}{{"token=secret-value", "", 200}, {"token=wrong", "", 401}, {"", "", 401}, {"", "Bearer secret-value", 200}, {"token=secret-value", "Bearer wrong", 401}, {"token=wrong", "Bearer secret-value", 200}, {"token=secret-value&token=secret-value", "", 401}, {"token=secret-value", "Basic secret-value", 401}}
+	for _, tc := range cases {
+		r := httptest.NewRequest("GET", "/api/v1/projects?"+tc.query, nil)
+		r.Header.Set("Authorization", tc.auth)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		if w.Code != tc.want {
+			t.Fatalf("%s %s: %d", tc.query, tc.auth, w.Code)
+		}
+		if strings.Contains(r.URL.RawQuery, "token") {
+			t.Fatal("token retained for logger")
+		}
+	}
+}

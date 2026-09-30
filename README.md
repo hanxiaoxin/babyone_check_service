@@ -130,3 +130,23 @@ go run .
 ```
 
 `git apply` 一次应用所有文件，不会自动提交。确认修改后执行 `git add .`、`git commit`、`git push`。Windows 下可在 Git Bash 或 PowerShell 中执行，将路径替换为实际补丁路径。如果 check 提示冲突，保留本地修改并提供最新仓库或差异，以便生成基于当前版本的增量补丁；不要忽略错误或强制覆盖。
+
+## URL Token 认证
+
+所有 `/api/v1` 接口现在也支持查询参数 `token`，无需额外开关：
+
+```text
+http://127.0.0.1:8080/api/v1/status?token=your-token&page=1&page_size=20
+http://127.0.0.1:8080/api/v1/settings?token=your-token
+```
+
+Token 与 `.env` 的 `API_TOKEN` 相同。原有 `Authorization: Bearer ...` 仍支持；两者同时提供时以请求头为准，错误请求头不会回退到 URL Token。重复 token 查询参数不作为有效凭据。应用在日志及错误处理中移除 URL token，但浏览器历史和上游代理仍可能记录原始 URL，外网访问请使用 HTTPS。默认 `.env.example` 使用 `CORS_ORIGIN=*` 允许任意来源。
+
+本次 `babyone_check_token.patch` 基于远端提交 `cd42608`（feat: add config），仅增加 URL Token 及补齐通配跨域支持。在项目根目录执行：
+
+```bash
+git pull --ff-only
+git apply --check /path/to/babyone_check_token.patch
+git apply /path/to/babyone_check_token.patch
+go test ./...
+```

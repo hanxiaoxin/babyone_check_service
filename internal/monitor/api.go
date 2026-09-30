@@ -6,6 +6,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,11 +21,25 @@ func id(c *gin.Context, key string) int64 {
 }
 func (s *Service) Router(token, origin string) *gin.Engine {
 	r := gin.New()
+	// Remove the credential before Gin logging/recovery can inspect the URL.
+	r.Use(func(c *gin.Context) {
+		query := c.Request.URL.Query()
+		values := query["token"]
+		if len(values) == 1 {
+			c.Set("query_token", values[0])
+		}
+		query.Del("token")
+		c.Request.URL.RawQuery = query.Encode()
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Next()
+	})
 	r.Use(gin.Logger(), gin.Recovery())
 	r.Use(func(c *gin.Context) {
-		if origin != "" && c.GetHeader("Origin") == origin {
+		if origin == "*" || (origin != "" && c.GetHeader("Origin") == origin) {
 			c.Header("Access-Control-Allow-Origin", origin)
-			c.Header("Vary", "Origin")
+			if origin != "*" {
+				c.Header("Vary", "Origin")
+			}
 			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
 			c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		}
@@ -43,7 +58,16 @@ func (s *Service) Router(token, origin string) *gin.Engine {
 	})
 	a := r.Group("/api/v1")
 	a.Use(func(c *gin.Context) {
-		if token == "" || subtle.ConstantTimeCompare([]byte(c.GetHeader("Authorization")), []byte("Bearer "+token)) != 1 {
+		provided := c.GetString("query_token")
+		if auth := c.GetHeader("Authorization"); auth != "" {
+			// A supplied header takes precedence; invalid headers cannot fall back to URL tokens.
+			if !strings.HasPrefix(auth, "Bearer ") {
+				fail(c, 401, "unauthorized")
+				return
+			}
+			provided = strings.TrimPrefix(auth, "Bearer ")
+		}
+		if token == "" || subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
 			fail(c, 401, "unauthorized")
 			return
 		}
