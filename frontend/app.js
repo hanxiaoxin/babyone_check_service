@@ -1,147 +1,54 @@
 import { certificateExpiry } from './expiry.js';
-const $ = id => document.getElementById(id);
-const el = (tag, text, cls) => { const n = document.createElement(tag); if (text !== undefined) n.textContent = text; if (cls) n.className = cls; return n; };
-const date = seconds => seconds ? new Date(seconds * 1000).toLocaleString() : '—';
-const states = {up:'正常', down:'异常', paused:'已暂停', unknown:'等待检测'};
-let connected = false;
-let token = '', projects = [], page = 1, pages = 0, version = 0;
-let historyTarget, historyWindow, cursor, historyVersion = 0;
-const url = new URL(location.href);
-const tokens = url.searchParams.getAll('token');
-url.searchParams.delete('token');
-history.replaceState(null, '', url.pathname + url.search + url.hash);
-function message(text = '', error = false) { $('message').textContent = text; $('message').className = error ? 'error' : 'success'; $('message').setAttribute('role', error ? 'alert' : 'status'); }
-function disconnect() { connected = false; token = ''; version++; historyVersion++; $('history').close(); $('workspace').hidden = true; $('login').hidden = false; $('logout').hidden = true; $('login-form').reset(); $('settings-form').reset(); $('targets').replaceChildren(); $('project-list').replaceChildren(); }
-async function api(path, method = 'GET', body) {
- const response = await fetch('/api/v1' + path, {method, headers:{Authorization:'Bearer ' + token, ...(body ? {'Content-Type':'application/json'} : {})}, ...(body ? {body:JSON.stringify(body)} : {}), cache:'no-store'});
- let data; try { data = await response.json(); } catch { throw new Error(`服务响应异常 (${response.status})，请稍后重试`); }
- if (!response.ok) { if (response.status === 401) disconnect(); throw new Error(data.error || `请求失败 (${response.status})`); }
- return data;
-}
-async function run(task, button) { const label=button?.textContent; if (button) { button.disabled=true; button.setAttribute('aria-busy','true'); button.textContent='处理中…'; } message(); try { await task(); } catch (e) { message(e.message, true); } finally { if (button) { button.disabled=false; button.removeAttribute('aria-busy'); button.textContent=label; } } }
-function action(text, task) { const button = el('button', text); button.type = 'button'; button.onclick = () => run(task, button); return button; }
-function tab(name) { $('message').textContent=''; for (const id of ['overview','projects','settings']) $(id).hidden = id !== name; document.querySelectorAll('[data-tab]').forEach(b => (b.classList.toggle('active', b.dataset.tab === name), b.setAttribute('aria-current', b.dataset.tab === name ? 'page' : 'false'))); }
-async function connect(value) {
- token = value;
- await loadProjects();
- connected = true; $('workspace').hidden = false; $('login').hidden = true; $('logout').hidden = false; $('login-form').reset(); tab('overview');
- await loadStatus();
-}
-async function loadProjects() {
- const data = await api('/projects'); projects = data.data;
- const selected = $('project-filter').value;
- $('project-filter').replaceChildren(new Option('全部项目',''));
- $('target-project').replaceChildren();
- for (const p of projects) { $('project-filter').add(new Option(p.name,p.id)); $('target-project').add(new Option(p.name,p.id)); }
- if (projects.some(p => String(p.id) === selected)) $('project-filter').value = selected;
- $('target-form').querySelector('button').disabled = !projects.length;
- $('project-list').replaceChildren();
- for (const p of projects) {
-  const card = el('article',undefined,'card'); card.append(el('h3',p.name));
-  const label = el('label','项目描述'); const input = el('textarea'); input.value = p.description; input.maxLength = 2000; label.append(input);
-  card.append(label, action('保存描述',async()=> { checkBytes(input.value,2000,'描述'); await api(`/projects/${p.id}`,'PATCH',{description:input.value}); p.description = input.value; message('项目描述已保存'); }));
-  $('project-list').append(card);
- }
- if (!projects.length) $('project-list').append(el('p','暂无项目，先创建一个项目。'));
-}
-function checkBytes(value, max, label) { if (new TextEncoder().encode(value).length > max) throw new Error(`${label}不能超过 ${max} UTF-8 字节`); }
-async function loadStatus() {
- const current = ++version;
- const pid = $('project-filter').value; const params = new URLSearchParams({page,page_size:20});
- if ($('kind-filter').value) params.set('kind',$('kind-filter').value);
- const data = await api((pid ? `/projects/${pid}/status` : '/status') + '?' + params);
- if (current !== version || !connected) return;
- pages = data.total_pages;
- $('counts').textContent = `共 ${data.total} 个目标 · 第 ${page} 页`;
- $('page-label').textContent = `${page} / ${Math.max(1,pages)}`;
- $('previous').disabled = page <= 1; $('next').disabled = page >= pages;
- $('page-label').parentElement.hidden = pages <= 1;
- $('targets').replaceChildren();
- for (const item of data.data) {
-  const t = item.target, r = item.latest; const card = el('article',undefined,'card target-card');
-  const heading=el('div',undefined,'card-heading'); heading.append(el('h3',t.name),el('span',states[item.state] || item.state,'badge ' + item.state)); card.append(heading);
-  const project = projects.find(p=>p.id===t.project_id);
-  card.append(el('p',`${project?.name || '项目 ' + t.project_id} · ${t.kind === 'ssl' ? 'SSL 证书' : '服务可用性'}`),el('p',t.address,'target-address'));
-  if (project?.description) { const description=el('p',project.description,'project-description'); description.title=project.description; card.append(description); }
-  const meta=el('div',undefined,'target-meta'); meta.append(el('span',`检测：${date(r?.checked_at)}`),el('span',`延迟 ${r ? r.latency_ms + ' ms' : '—'}`)); card.append(meta);
-  if (r?.expires_at) { const expiry=el('div',undefined,'expiry'); expiry.dataset.expires=r.expires_at; expiry.append(el('p',`证书到期：${date(r.expires_at)}`),el('div',undefined,'expiry-detail')); card.append(expiry); updateExpiry(expiry); }
-  if (r?.error) { const error=el('details',undefined,'target-error'); error.append(el('summary','查看错误详情'),el('p',r.error)); card.append(error); }
-  const buttons = el('div',undefined,'actions');
-  buttons.append(action('历史与统计',()=>openHistory(t)),action(t.enabled ? '暂停' : '恢复',async()=> { await api(`/targets/${t.id}`,'PATCH',{enabled:!t.enabled}); await loadStatus(); })); card.append(buttons); $('targets').append(card);
- }
- $('targets').querySelectorAll('.target-address').forEach(n=>n.title=n.textContent);
- if (!data.data.length) $('targets').append(el('p','暂无检测目标，可在项目管理中添加。','empty-state'));
- $('updated-at').textContent = '更新于 ' + new Date().toLocaleTimeString();
-}
-async function loadSettings() {
- const s = await api('/settings'), f = $('settings-form').elements;
- $('smtp-status').textContent = `SMTP ${s.smtp_configured ? '已配置' : '未配置'} · 证书提前 ${s.ssl_warning_days} 天预警`;
- for (const key of ['host','port','tls_mode','username','from']) f[key].value = s.smtp[key] ?? '';
- f.to.value = (s.smtp.to || []).join(', ');
- f.password.value = ''; f.clear_password.checked = false;
- f.auto_notify.checked = s.auto_notify;
- f.ssl_warning_days.value = s.ssl_warning_days;
- $('smtp-password-status').textContent = s.smtp_password_set ? '已保存密码，留空保持原值' : '尚未设置密码';
-}
-
-async function openHistory(t) { $('dialog-message').textContent=''; historyTarget = t; $('history-title').textContent = t.name + ' · 检测历史'; if (!$('history').open) $('history').showModal(); await resetHistory(); }
-async function resetHistory() {
- const current = ++historyVersion;
- cursor = null; $('history-rows').replaceChildren(); $('stats').textContent = '加载中…'; $('more-history').hidden = true;
- const to = Math.floor(Date.now()/1000)+1; historyWindow = new URLSearchParams({from:to-Number($('history-range').value),to});
- let stats; try { stats=await api(`/targets/${historyTarget.id}/stats?${historyWindow}`); } catch(e) { if(current===historyVersion) { $('stats').textContent=''; $('dialog-message').textContent=e.message; } throw e; }
- if (current !== historyVersion || !$('history').open) return;
- $('stats').textContent = `${historyTarget.kind === 'ssl' ? 'TLS 校验成功率' : '样本可用率'}：${stats.availability_percent == null ? '—' : stats.availability_percent.toFixed(2)+'%'} · 样本 ${stats.samples} · 平均延迟 ${stats.avg_latency_ms == null ? '—' : stats.avg_latency_ms.toFixed(0)+' ms'}`;
- await loadHistory(current);
-}
-async function loadHistory(current = historyVersion) {
- const params = new URLSearchParams(historyWindow); params.set('limit',50); if (cursor) params.set('before_id',cursor);
- let data; try { data=await api(`/targets/${historyTarget.id}/history?${params}`); $('dialog-message').textContent=''; } catch(e) { if(current===historyVersion) $('dialog-message').textContent=e.message; throw e; }
- if (current !== historyVersion || !$('history').open) return;
- for (const r of data.data) { const row = el('tr'); for (const value of [date(r.checked_at),r.ok?'成功':'失败',r.latency_ms+' ms',r.http_status || '—',date(r.expires_at),r.error || '—']) row.append(el('td',String(value))); $('history-rows').append(row); }
- if (!$('history-rows').children.length) { const row = el('tr'); const cell = el('td','此时间范围暂无检测记录'); cell.colSpan = 6; row.append(cell); $('history-rows').append(row); }
- cursor = data.next_before_id; $('more-history').hidden = !cursor;
-}
-$('login-form').onsubmit = e => { e.preventDefault(); run(()=>connect(e.target.elements.token.value),e.submitter); };
-$('logout').onclick = () => { disconnect(); message('已退出'); };
-document.querySelectorAll('[data-tab]').forEach(button=>button.onclick=()=>run(async()=>{tab(button.dataset.tab); if(button.dataset.tab==='settings') await loadSettings();}));
-$('refresh').onclick = () => run(loadStatus,$('refresh'));
-for (const id of ['project-filter','kind-filter']) $(id).onchange=()=>run(async()=>{ page=1; await loadStatus(); });
-$('previous').onclick = () => run(async()=>{page=Math.max(1,page-1); await loadStatus();});
-$('next').onclick = () => run(async()=>{page++; await loadStatus();});
-$('project-form').onsubmit=e=>{e.preventDefault();run(async()=>{ const form=e.target; const name=form.elements.name.value.trim(), description=form.elements.description.value; if(!name) throw new Error('请输入项目名称'); checkBytes(name,100,'名称'); checkBytes(description,2000,'描述'); await api('/projects','POST',{name,description}); form.reset(); await loadProjects(); message('项目已创建'); },e.submitter);};
-const targetForm = $('target-form');
-targetForm.elements.kind.onchange = () => { const ssl=targetForm.elements.kind.value==='ssl'; targetForm.elements.interval_seconds.value=ssl?86400:60; targetForm.elements.address.placeholder=ssl?'example.com（仅域名）':'https://example.com/health'; $('expected-label').hidden=ssl; };
-targetForm.onsubmit=e=>{e.preventDefault();run(async()=>{const form=e.target, f=form.elements; const body={name:f.name.value.trim(),kind:f.kind.value,address:f.address.value.trim(),interval_seconds:Number(f.interval_seconds.value),timeout_seconds:Number(f.timeout_seconds.value),expected_status:Number(f.expected_status.value),enabled:true}; checkBytes(body.name,100,'名称'); if(body.timeout_seconds>=body.interval_seconds) throw new Error('超时必须小于检测间隔'); await api(`/projects/${f.project.value}/targets`,'POST',body); f.name.value=''; f.address.value=''; page=1; await loadStatus(); message('检测目标已添加');},e.submitter);};
-$('settings-form').onsubmit=e=>{e.preventDefault();run(async()=>{
- const f=e.target.elements;
- const smtp={host:f.host.value.trim(),port:Number(f.port.value),tls_mode:f.tls_mode.value,username:f.username.value.trim(),password:f.password.value,from:f.from.value.trim(),to:f.to.value.split(/[,，\n]/).map(v=>v.trim()).filter(Boolean)};
- await api('/settings','PATCH',{auto_notify:f.auto_notify.checked,ssl_warning_days:Number(f.ssl_warning_days.value),smtp,clear_smtp_password:f.clear_password.checked});
- f.password.value=''; await loadSettings(); message('通知设置已保存，立即生效');
-},e.submitter);};
-$('close-history').onclick=()=>{historyVersion++;$('history').close();};
-$('history').addEventListener('close',()=>historyVersion++);
-$('history-range').onchange=()=>run(resetHistory);
-$('more-history').onclick=()=>run(()=>loadHistory(),$('more-history'));
-run(async()=>{
- const response = await fetch('/auth/config', {cache:'no-store'});
- if(!response.ok) throw new Error('无法读取认证配置');
- const config = await response.json();
- if(!config.auth_required) { await connect(''); $('logout').hidden=true; }
- else if(tokens.length===1 && tokens[0]) await connect(tokens[0]);
-});
-
-function updateExpiry(node) {
- const info=certificateExpiry(Number(node.dataset.expires));
- node.className='expiry expiry-'+info.level;
- const detail=node.querySelector('.expiry-detail');
- detail.replaceChildren(el('strong',info.text),el('span',info.label,'expiry-label'));
-}
-setInterval(()=>document.querySelectorAll('[data-expires]').forEach(updateExpiry),60000);
-$('history').addEventListener('click',event=>{
- if(event.target!==$('history')) return;
- const r=$('history').getBoundingClientRect();
- if(event.clientX<r.left || event.clientX>r.right || event.clientY<r.top || event.clientY>r.bottom) $('history').close();
-});
-$('history').addEventListener('close',()=>document.body.classList.remove('modal-open'));
-new MutationObserver(()=>document.body.classList.toggle('modal-open',$('history').open)).observe($('history'),{attributes:true,attributeFilter:['open']});
+const $=id=>document.getElementById(id);
+const el=(tag,text,cls)=>{const n=document.createElement(tag);if(text!==undefined)n.textContent=text;if(cls)n.className=cls;return n};
+const date=seconds=>seconds?new Date(seconds*1000).toLocaleString():'—';
+const states={up:'正常',down:'异常',unknown:'等待检测',paused:'已暂停'};
+const duration=s=>s>=86400?`${(s/86400).toFixed(1).replace(/\.0$/,'')} 天`:s>=3600?`${(s/3600).toFixed(1).replace(/\.0$/,'')} 小时`:s>=60?`${(s/60).toFixed(1).replace(/\.0$/,'')} 分钟`:`${s} 秒`;
+let token='',connected=false,monitors=[],page=1,pages=0,statusVersion=0,detailVersion=0,detailTarget=null,detailWindow=null,cursor=null,historyCount=0,historyView='chart',deleteTarget=null,serverOffset=0;
+let mailBusy=false;
+const url=new URL(location.href),tokens=url.searchParams.getAll('token');url.searchParams.delete('token');history.replaceState(null,'',url.pathname+url.search+url.hash);
+function message(text='',error=false){$('message').textContent=text;$('message').className=error?'error':'success'}
+async function api(path,method='GET',body){const response=await fetch('/api/v1'+path,{method,headers:{...(token?{Authorization:'Bearer '+token}:{}),...(body?{'Content-Type':'application/json'}:{})},...(body?{body:JSON.stringify(body)}:{}),cache:'no-store'});let data;try{data=await response.json()}catch{throw new Error(`服务响应异常 (${response.status})`)}if(!response.ok){if(response.status===401)disconnect();throw new Error(data.error||`请求失败 (${response.status})`)}return data}
+async function run(task,button,errorNode){const text=button?.textContent;if(button){if(button.disabled)return;button.disabled=true;button.textContent='处理中…'}if(errorNode)errorNode.textContent='';else message();try{await task()}catch(e){if(errorNode)errorNode.textContent=e.message;else message(e.message,true)}finally{if(button){button.disabled=false;button.textContent=text}}}
+function action(text,fn,cls='secondary'){const b=el('button',text,cls);b.type='button';b.onclick=()=>run(fn,b);return b}
+function disconnect(){connected=false;token='';statusVersion++;detailVersion++;document.querySelectorAll('dialog[open]').forEach(d=>d.close());$('workspace').hidden=true;$('login').hidden=false;$('logout').hidden=true;$('login-form').reset();$('settings-form').reset();$('monitor-form').reset();monitors=[];$('targets').replaceChildren();$('monitor-list').replaceChildren()}
+function tab(name){for(const id of ['overview','projects','settings'])$(id).hidden=id!==name;document.querySelectorAll('[data-tab]').forEach(b=>{b.classList.toggle('active',b.dataset.tab===name);b.setAttribute('aria-current',b.dataset.tab===name?'page':'false')})}
+async function connect(value){token=value;await loadMonitors();connected=true;$('workspace').hidden=false;$('login').hidden=true;$('logout').hidden=false;$('login-form').reset();tab('overview');await loadStatus()}
+async function loadMonitors(){monitors=(await api('/monitors')).data;renderManagement()}
+function renderManagement(){const q=$('manage-search').value.toLowerCase(),kind=$('manage-kind').value;const items=monitors.filter(t=>(!kind||t.kind===kind)&&`${t.name} ${t.description} ${t.address}`.toLowerCase().includes(q));$('monitor-list').replaceChildren();for(const t of items){const row=el('tr');const name=el('td');name.append(el('strong',t.name));if(t.description)name.append(el('p',t.description,'manage-description'));const address=el('td');address.append(el('span',t.kind==='ssl'?'SSL 证书':'HTTP 服务','badge'),el('p',t.address));const config=el('td');config.append(el('div','每 '+duration(t.interval_seconds)),el('small',`超时 ${t.timeout_seconds} 秒${t.kind==='http'?' · HTTP '+t.expected_status:''}`));const state=el('td');state.append(el('span',t.enabled?'已启用':'已暂停','badge '+(t.enabled?'up':'paused')));const buttons=el('td',undefined,'table-actions');buttons.append(action('编辑',()=>openEditor(t)),action(t.enabled?'暂停':'恢复',async()=>{await api(`/monitors/${t.id}`,'PATCH',{enabled:!t.enabled});await reload()}),action('历史',()=>openHistory(t)),action('删除',()=>openDelete(t),'danger-quiet'));row.append(name,address,config,state,buttons);$('monitor-list').append(row)}if(!items.length){const row=el('tr'),cell=el('td','暂无匹配项目，点击“创建项目”添加。','empty-state');cell.colSpan=5;row.append(cell);$('monitor-list').append(row)}}
+async function reload(){await loadMonitors();await loadStatus()}
+function expiryBlock(expires){const block=el('div',undefined,'expiry');block.dataset.expires=expires;block.append(el('p','证书到期：'+date(expires)),el('div',undefined,'expiry-detail'));updateExpiry(block);return block}
+function updateExpiry(node){const value=certificateExpiry(Number(node.dataset.expires),Math.floor(Date.now()/1000)+serverOffset);node.className='expiry expiry-'+value.level;node.querySelector('.expiry-detail').replaceChildren(el('strong',value.text),el('span',value.label,'expiry-label'))}
+function countdown(node){const target=Number(node.dataset.next),enabled=node.dataset.enabled==='true';if(!enabled){node.textContent='已暂停';return}if(node.dataset.checking==='true'){node.textContent='正在检测';return}if(!target){node.textContent='等待调度';return}const remaining=target-Math.floor(Date.now()/1000)-serverOffset;const clock=[Math.floor(Math.max(0,remaining)/3600),Math.floor(Math.max(0,remaining)%3600/60),Math.max(0,remaining)%60].map(v=>String(v).padStart(2,'0')).join(':');node.textContent=remaining<=0?'即将检测 / 排队中':`下次检测 ${clock}`;node.title='预计下次检测：'+date(target)}
+async function loadStatus(){const version=++statusVersion,params=new URLSearchParams({page,page_size:20});if($('kind-filter').value)params.set('kind',$('kind-filter').value);const data=await api('/status?'+params);if(version!==statusVersion||!connected)return;if(data.total_pages&&page>data.total_pages){page=data.total_pages;return loadStatus()}pages=data.total_pages;$('page-label').textContent=`${page} / ${Math.max(1,pages)}`;$('page-label').parentElement.hidden=pages<=1;$('previous').disabled=page<=1;$('next').disabled=page>=pages;$('counts').textContent=`共 ${data.total} 个服务 · 当前页 ${data.data.length} 个`;$('updated-at').textContent='更新于 '+new Date().toLocaleTimeString();$('summary').replaceChildren();const summary=data.summary||{};$('summary').append(el('strong',summary.down?'部分服务异常':summary.unknown?'部分服务等待检测':summary.up?'运行服务正常':summary.paused?'全部已暂停':'暂无监测服务','overall-status'));for(const [state,label] of Object.entries(states))$('summary').append(el('span',`${label} ${summary[state]||0}`,'badge '+state));$('targets').replaceChildren();const byId=new Map();for(const item of data.data){const t=item.target,r=item.latest;serverOffset=item.server_time-Math.floor(Date.now()/1000);const card=el('article',undefined,'service-row');const head=el('div',undefined,'service-heading');const title=el('div');title.append(action(t.name,()=>openHistory(t),'service-link'),el('span',t.kind==='ssl'?'SSL':'HTTP','type-tag'));if(t.description)title.append(el('small',t.description));head.append(title,el('span',states[item.state],'badge '+item.state));const address=el('p',t.address,'service-address');const timeline=el('div',undefined,'timeline');timeline.setAttribute('aria-label',t.name+' 最近30天检测历史');const meta=el('div',undefined,'service-meta');const next=el('span',undefined,'countdown');Object.assign(next.dataset,{next:item.next_check_at,checking:item.checking,enabled:t.enabled});countdown(next);meta.append(el('span','每 '+duration(t.interval_seconds)+' 检测'),el('span','最近 '+date(r?.checked_at)),el('span','耗时 '+(r?r.latency_ms+' ms':'—')),next);card.append(head,address,timeline,meta);if(r?.expires_at)card.append(expiryBlock(r.expires_at));if(r?.error){const error=el('details',undefined,'target-error');error.append(el('summary','查看最近错误'),el('p',r.error));card.append(error)}$('targets').append(card);byId.set(t.id,{timeline,card,target:t})}if(!data.data.length){$('targets').append(el('p','暂无监测项目，可在项目管理中创建。','empty-state'));return}try{const hist=await api('/monitors/timeline?ids='+data.data.map(i=>i.target.id).join(','));if(version!==statusVersion)return;for(const [id,view]of byId){const buckets=hist.data.filter(b=>b.target_id===id);renderTimeline(view.timeline,buckets,hist.from,hist.to,86400,()=>openHistory(view.target));const total=buckets.reduce((n,b)=>n+b.samples,0),good=buckets.reduce((n,b)=>n+b.successful,0);view.card.querySelector('.service-heading').append(el('small',`${view.target.kind==='ssl'?'TLS 成功率':'可用率'} ${total?(good*100/total).toFixed(2)+'%':'—'}`,'availability'))}}catch(e){if(version===statusVersion)for(const view of byId.values())view.timeline.replaceChildren(action('历史加载失败，点击重试',loadStatus))}}
+function renderTimeline(node,buckets,from,to,step,onSelect){node.replaceChildren();const byStart=new Map(buckets.map(b=>[b.start,b]));for(let start=Math.floor(from/step)*step;start<to;start+=step){const b=byStart.get(start),cls=!b||!b.samples?'empty':b.successful===b.samples?'good':b.successful===0?'bad':'mixed';const block=el('button',undefined,'time-block '+cls);block.type='button';const text=`${date(start)} — ${date(Math.min(start+step,to))}\n${b?`成功 ${b.successful} / ${b.samples} · 失败 ${b.samples-b.successful} · 平均 ${b.avg_latency_ms.toFixed(0)} ms`:'无数据'}`;block.title=text;block.setAttribute('aria-label',text);block.onclick=()=>onSelect?.(start);node.append(block)}}
+function openEditor(target){const form=$('monitor-form');form.reset();const f=form.elements;f.id.value=target?.id||'';const initial=target||{kind:'http',interval_seconds:60,timeout_seconds:10,expected_status:200,enabled:true};for(const k of ['name','description','kind','address','interval_seconds','timeout_seconds','expected_status'])if(initial[k]!==undefined)f[k].value=initial[k];f.enabled.checked=initial.enabled;$('editor-title').textContent=target?'编辑项目':'创建项目';$('editor-error').textContent='';editorKind(false);$('editor').showModal();f.name.focus()}
+function editorKind(reset){const f=$('monitor-form').elements,ssl=f.kind.value==='ssl';$('expected-label').hidden=ssl;f.expected_status.required=!ssl;f.address.placeholder=ssl?'example.com':'https://example.com/health';$('address-help').textContent=ssl?'仅填写域名，不包含 https://、端口或路径':'完整 HTTP / HTTPS 地址';if(reset)f.interval_seconds.value=ssl?86400:60}
+function openDelete(t){deleteTarget=t;$('delete-description').textContent=`确定删除“${t.name}”？`;$('delete-error').textContent='';$('delete-dialog').showModal()}
+async function loadSettings(){const data=await api('/settings'),f=$('settings-form').elements;for(const k of ['host','port','tls_mode','username','from'])f[k].value=data.smtp[k]??'';f.to.value=(data.smtp.to||[]).join(', ');f.password.value='';f.clear_password.checked=false;f.auto_notify.checked=data.auto_notify;f.ssl_warning_days.value=data.ssl_warning_days;$('smtp-status').textContent=`SMTP ${data.smtp_configured?'已配置':'未配置'} · 提前 ${data.ssl_warning_days} 天通知`;$('smtp-password-status').textContent=data.smtp_password_set?'已保存密码，留空保留':'尚未设置密码';$('test-mail').disabled=!data.smtp_configured||mailBusy;$('mail-feedback').textContent='测试使用已保存的配置，修改后请先保存。'}
+const localDate=seconds=>{const d=new Date(seconds*1000);return new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,19)};
+function setRange(seconds){const to=Math.floor(Date.now()/1000)+1;$('history-from').value=localDate(to-seconds);$('history-to').value=localDate(to);document.querySelectorAll('[data-range]').forEach(b=>b.classList.toggle('active',Number(b.dataset.range)===seconds))}
+function detailTab(name){historyView=name;$('history-chart').hidden=name!=='chart';$('history-records').hidden=name!=='records';document.querySelectorAll('[data-history-tab]').forEach(b=>b.classList.toggle('active',b.dataset.historyTab===name));$('more-history').hidden=name!=='records'||!cursor}
+async function openHistory(t){detailTarget=t;$('history-title').textContent=t.name+' · 历史与统计';$('history-subtitle').textContent=`${t.kind==='ssl'?'SSL 证书':'HTTP 服务'} · ${t.address}`;setRange(2592000);detailTab('chart');$('history').showModal();await queryHistory()}
+async function queryHistory(){const version=++detailVersion,id=detailTarget.id;const from=Math.floor(new Date($('history-from').value).getTime()/1000),to=Math.floor(new Date($('history-to').value).getTime()/1000);if(!Number.isFinite(from)||!Number.isFinite(to)||to<=from||to-from>366*86400){$('dialog-message').textContent='请选择有效时间范围，最长 366 天';return}detailWindow=new URLSearchParams({from,to});cursor=null;historyCount=0;$('history-rows').replaceChildren();$('history-metrics').replaceChildren(el('p','正在加载…'));$('dialog-message').textContent='';$('detail-timeline').replaceChildren();$('latency-chart').replaceChildren();$('more-history').hidden=true;$('history-count').textContent='';const step=to-from<=7*86400?3600:86400;try{const stats=await api(`/targets/${id}/stats?${detailWindow}&bucket_seconds=${step}`);if(version!==detailVersion||!$('history').open)return;$('history-metrics').replaceChildren();for(const [label,value]of [[detailTarget.kind==='ssl'?'TLS 校验成功率':'样本可用率',stats.availability_percent===null?'—':stats.availability_percent.toFixed(2)+'%'],['检测样本',stats.samples],['失败次数',stats.samples-stats.successful],['平均耗时',stats.avg_latency_ms===null?'—':stats.avg_latency_ms.toFixed(0)+' ms']]){const card=el('div',undefined,'metric');card.append(el('small',label),el('strong',String(value)));$('history-metrics').append(card)}$('chart-caption').textContent=`${date(from)} 至 ${date(to)} · 每格 ${step===3600?'1 小时':'1 天'}`;renderTimeline($('detail-timeline'),stats.buckets,from,to,step,start=>{const end=Math.min(to,start+step);$('history-from').value=localDate(Math.max(from,start));$('history-to').value=localDate(end);detailTab('records');run(queryHistory,$('apply-range'),$('dialog-message'))});renderLatency(stats.buckets);await loadHistory(version,id)}catch(e){if(version===detailVersion){$('history-metrics').replaceChildren();$('dialog-message').textContent=e.message}}}
+function renderLatency(buckets){$('latency-chart').replaceChildren();if(!buckets.length){$('latency-chart').append(el('p','此时间范围暂无检测数据。','empty-state'));return}const max=Math.max(1,...buckets.map(b=>b.avg_latency_ms));const title=el('p','平均检测耗时');const bars=el('div',undefined,'latency-bars');for(const b of buckets){const bar=el('div',undefined,'latency-bar');bar.style.height=Math.max(2,b.avg_latency_ms/max*100)+'%';bar.title=`${date(b.start)} · ${b.avg_latency_ms.toFixed(0)} ms`;bars.append(bar)}$('latency-chart').append(title,bars,el('small',`最高平均耗时 ${max.toFixed(0)} ms · 悬停查看时间与耗时`))}
+async function loadHistory(version=detailVersion,id=detailTarget.id){const params=new URLSearchParams(detailWindow);params.set('limit',50);if(cursor)params.set('before_id',cursor);const data=await api(`/targets/${id}/history?${params}`);if(version!==detailVersion||!$('history').open)return;for(const r of data.data){const row=el('tr');row.append(el('td',date(r.checked_at)));const state=el('td');state.append(el('span',r.ok?'成功':'失败','badge '+(r.ok?'up':'down')));row.append(state);for(const v of [r.latency_ms+' ms',r.http_status||'—',date(r.expires_at),r.error||'—'])row.append(el('td',String(v)));$('history-rows').append(row)}historyCount+=data.data.length;cursor=data.next_before_id;$('history-count').textContent=`已加载 ${historyCount} 条记录${cursor?'':' · 已全部加载'}`;if(!historyCount){const row=el('tr'),cell=el('td','此时间范围没有检测记录。','empty-state');cell.colSpan=6;row.append(cell);$('history-rows').append(row)}detailTab(historyView)}
+$('login-form').onsubmit=e=>{e.preventDefault();run(()=>connect(e.target.elements.token.value),e.submitter)};
+$('logout').onclick=()=>{disconnect();message('已退出')};
+document.querySelectorAll('[data-tab]').forEach(b=>b.onclick=()=>run(async()=>{tab(b.dataset.tab);if(b.dataset.tab==='settings')await loadSettings();if(b.dataset.tab==='projects')await loadMonitors()}));
+$('refresh').onclick=()=>run(loadStatus,$('refresh'));$('kind-filter').onchange=()=>run(async()=>{page=1;await loadStatus()});
+$('previous').onclick=()=>run(async()=>{page=Math.max(1,page-1);await loadStatus()});$('next').onclick=()=>run(async()=>{page++;await loadStatus()});
+$('manage-search').oninput=renderManagement;$('manage-kind').onchange=renderManagement;$('create-monitor').onclick=()=>openEditor();$('monitor-form').elements.kind.onchange=()=>editorKind(true);
+$('monitor-form').onsubmit=e=>{e.preventDefault();run(async()=>{const f=e.target.elements,name=f.name.value.trim(),description=f.description.value;if(new TextEncoder().encode(name).length>100||new TextEncoder().encode(description).length>2000)throw new Error('名称最多 100 字节，描述最多 2000 字节');const body={name,description,kind:f.kind.value,address:f.address.value.trim(),interval_seconds:Number(f.interval_seconds.value),timeout_seconds:Number(f.timeout_seconds.value),expected_status:Number(f.expected_status.value),enabled:f.enabled.checked};if(body.timeout_seconds>=body.interval_seconds)throw new Error('超时必须小于检测间隔');await api('/monitors'+(f.id.value?'/'+f.id.value:''),f.id.value?'PATCH':'POST',body);$('editor').close();await reload();message('项目已保存')},e.submitter,$('editor-error'))};
+$('confirm-delete').onclick=()=>run(async()=>{await api(`/monitors/${deleteTarget.id}`,'DELETE');$('delete-dialog').close();await reload();message('项目已删除')},$('confirm-delete'),$('delete-error'));
+$('settings-form').onsubmit=e=>{e.preventDefault();run(async()=>{const f=e.target.elements;await api('/settings','PATCH',{auto_notify:f.auto_notify.checked,ssl_warning_days:Number(f.ssl_warning_days.value),smtp:{host:f.host.value.trim(),port:Number(f.port.value),tls_mode:f.tls_mode.value,username:f.username.value.trim(),password:f.password.value,from:f.from.value.trim(),to:f.to.value.split(/[,，\n]/).map(v=>v.trim()).filter(Boolean)},clear_smtp_password:f.clear_password.checked});await loadSettings();message('通知设置已保存')},e.submitter)};
+$('test-mail').onclick=()=>run(async()=>{mailBusy=true;try{await api('/settings/test-mail','POST');$('mail-feedback').textContent='SMTP 已接受测试邮件，请检查收件箱和垃圾邮件。'}finally{mailBusy=false}},$('test-mail'),$('mail-feedback'));
+for(const id of ['apply-range','history-retry'])$(id).onclick=()=>run(queryHistory,$(id),$('dialog-message'));
+document.querySelectorAll('[data-range]').forEach(b=>b.onclick=()=>{setRange(Number(b.dataset.range));run(queryHistory,b,$('dialog-message'))});
+document.querySelectorAll('[data-history-tab]').forEach(b=>b.onclick=()=>detailTab(b.dataset.historyTab));
+$('more-history').onclick=()=>run(()=>loadHistory(),$('more-history'),$('dialog-message'));
+document.querySelectorAll('[data-close]').forEach(b=>b.onclick=()=>$(b.dataset.close).close());
+for(const dialog of document.querySelectorAll('dialog')){dialog.addEventListener('click',e=>{if(e.target!==dialog)return;const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close()});dialog.addEventListener('close',()=>{if(dialog.id==='history')detailVersion++;document.body.classList.toggle('modal-open',!!document.querySelector('dialog[open]'))});new MutationObserver(()=>document.body.classList.toggle('modal-open',!!document.querySelector('dialog[open]'))).observe(dialog,{attributes:true,attributeFilter:['open']})}
+setInterval(()=>{document.querySelectorAll('.countdown').forEach(countdown);document.querySelectorAll('[data-expires]').forEach(updateExpiry)},1000);
+setInterval(()=>{if(connected&&!document.hidden&&!$('overview').hidden&&!document.querySelector('dialog[open]'))loadStatus().catch(()=>{})},15000);
+run(async()=>{const r=await fetch('/auth/config',{cache:'no-store'});if(!r.ok)throw new Error('无法读取认证配置');const c=await r.json();if(!c.auth_required){await connect('');$('logout').hidden=true}else if(tokens.length===1&&tokens[0])await connect(tokens[0])});

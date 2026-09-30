@@ -2,551 +2,269 @@ package monitor
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"mime"
+	"mime/multipart"
+	"mime/quotedprintable"
 	"net/http"
 	"net/http/httptest"
+	"net/mail"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
 
-func TestHTTPCheck(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(503) }))
-	defer srv.Close()
-	target := Target{ID: 1, Kind: "http", Address: srv.URL, Timeout: 2, Expected: 200}
-	r := Check(context.Background(), target)
-	if r.OK || r.Status != 503 || r.Error == "" {
-		t.Fatalf("bad failure: %+v", r)
-	}
-	target.Expected = 503
-	if !Check(context.Background(), target).OK {
-		t.Fatal("custom status failed")
-	}
-}
-func TestStatsAndAuthentication(t *testing.T) {
+func testService(t *testing.T) *Service {
+	t.Helper()
 	s, e := Open(filepath.Join(t.TempDir(), "test.db"))
 	if e != nil {
 		t.Fatal(e)
 	}
-	defer s.Close()
-	if e = s.Seed(); e != nil {
+	t.Cleanup(func() { s.Close() })
+	if e = s.ConfigureNotifications(SMTPConfig{Port: 587, TLSMode: "starttls"}, false); e != nil {
 		t.Fatal(e)
 	}
-	if e = s.Seed(); e != nil {
-		t.Fatal(e)
-	}
-	ts, e := s.Targets(0)
-	if e != nil || len(ts) != 6 {
-		t.Fatalf("seed: %v %d", e, len(ts))
-	}
-	now := time.Now().Unix()
-	for _, ok := range []bool{true, true, false} {
-		if e = s.Save(Result{TargetID: ts[0].ID, At: now, OK: ok, Latency: 100}); e != nil {
-			t.Fatal(e)
-		}
-	}
-	router := s.Router("test-token", "")
-	request := func(path, token string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("GET", path, nil)
-		r.Header.Set("Authorization", token)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, r)
-		return w
-	}
-	if request("/api/v1/projects", "").Code != 401 {
-		t.Fatal("auth bypass")
-	}
-	w := request("/api/v1/targets/1/stats", "Bearer test-token")
-	if w.Code != 200 {
-		t.Fatal(w.Body.String())
-	}
-	var body struct {
-		Samples int     `json:"samples"`
-		Percent float64 `json:"availability_percent"`
-	}
-	if e = json.Unmarshal(w.Body.Bytes(), &body); e != nil {
-		t.Fatal(e)
-	}
-	if body.Samples != 3 || body.Percent < 66.66 || body.Percent > 66.67 {
-		t.Fatalf("stats: %+v", body)
-	}
-	w = request("/api/v1/targets/2/stats", "Bearer test-token")
-	var empty map[string]any
-	json.Unmarshal(w.Body.Bytes(), &empty)
-	if empty["availability_percent"] != nil {
-		t.Fatal("no samples must be null")
-	}
-	if request("/api/v1/targets/1/stats?from=5&to=4", "Bearer test-token").Code != 400 {
-		t.Fatal("bad time accepted")
-	}
+	return s
 }
-func TestValidationAndStale(t *testing.T) {
-	if Validate(Target{Name: "x", Kind: "ssl", Address: "https://example.com", Interval: 60, Timeout: 10}) == nil {
-		t.Fatal("bad host accepted")
-	}
-	if !stale(Target{Interval: 60, Timeout: 10}, &Result{At: time.Now().Unix() - 200}) {
-		t.Fatal("old result considered current")
-	}
-}
-
-func TestStatusPagination(t *testing.T) {
-	s, e := Open(filepath.Join(t.TempDir(), "test.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close()
-	if e = s.Seed(); e != nil {
-		t.Fatal(e)
-	}
-	router := s.Router("token", "")
-	get := func(path string) (int, map[string]any) {
-		r := httptest.NewRequest("GET", path, nil)
-		r.Header.Set("Authorization", "Bearer token")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, r)
-		var b map[string]any
-		json.Unmarshal(w.Body.Bytes(), &b)
-		return w.Code, b
-	}
-	code, b := get("/api/v1/status?page=2&page_size=2")
-	if code != 200 || b["total"] != float64(6) || b["total_pages"] != float64(3) {
-		t.Fatalf("metadata: %d %+v", code, b)
-	}
-	data := b["data"].([]any)
-	if len(data) != 2 || data[0].(map[string]any)["target"].(map[string]any)["id"] != float64(3) {
-		t.Fatalf("page: %+v", data)
-	}
-	code, b = get("/api/v1/projects/4/status?page_size=2")
-	if code != 200 || b["total"] != float64(3) {
-		t.Fatalf("project filter: %+v", b)
-	}
-	_, b = get("/api/v1/status?page=100&page_size=2")
-	if len(b["data"].([]any)) != 0 {
-		t.Fatal("out of range page")
-	}
-	for _, q := range []string{"page=0", "page=-1", "page=oops", "page_size=101", "page_size=0", "page=9223372036854775807"} {
-		if c, _ := get("/api/v1/status?" + q); c != 400 {
-			t.Fatalf("invalid query accepted: %s", q)
-		}
-	}
-}
-
-func TestNotifications(t *testing.T) {
-	s, e := Open(filepath.Join(t.TempDir(), "notify.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close()
-	s.Seed()
-	cfg := SMTPConfig{Host: "smtp.example.com", Port: 587, TLSMode: "starttls", From: "from@example.com", To: []string{"to@example.com"}}
-	if e = s.ConfigureNotifications(cfg, true); e != nil {
-		t.Fatal(e)
-	}
-	calls := 0
-	shouldFail := false
-	s.notify.send = func(context.Context, string, string) error {
-		calls++
-		if shouldFail {
-			return fmt.Errorf("failed")
-		}
-		return nil
-	}
-	ts, _ := s.Targets(0)
-	target := ts[0]
-	r := Result{TargetID: target.ID, At: time.Now().Unix(), OK: true}
-	if e = s.Notify(context.Background(), target, r); e != nil {
-		t.Fatal(e)
-	}
-	if calls != 0 {
-		t.Fatal("initial healthy mail")
-	}
-	r.OK = false
-	s.Notify(context.Background(), target, r)
-	s.Notify(context.Background(), target, r)
-	if calls != 1 {
-		t.Fatal("duplicate failure notification")
-	}
-	r.OK = true
-	s.Notify(context.Background(), target, r)
-	if calls != 2 {
-		t.Fatal("missing recovery")
-	}
-	shouldFail = true
-	r.OK = false
-	s.Notify(context.Background(), target, r)
-	shouldFail = false
-	s.Notify(context.Background(), target, r)
-	if calls != 4 {
-		t.Fatal("failed send not retried")
-	}
-	if e = s.ConfigureNotifications(cfg, false); e != nil {
-		t.Fatal(e)
-	}
-	enabled, _ := s.autoNotify()
-	if !enabled {
-		t.Fatal("restart overwrote persisted setting")
-	}
-	s.notify.send = func(context.Context, string, string) error { calls++; return nil }
-	s.Notify(context.Background(), target, r)
-	if calls != 4 {
-		t.Fatal("dedup lost on reconfiguration")
-	}
-	cert := ts[3]
-	r = Result{TargetID: cert.ID, At: time.Now().Unix(), OK: true, Expires: time.Now().Add(12 * time.Hour).Unix()}
-	s.Notify(context.Background(), cert, r)
-	s.Notify(context.Background(), cert, r)
-	if calls != 5 {
-		t.Fatal("SSL warning dedup")
-	}
-	s.db.Exec(`UPDATE service_settings SET auto_notify=0`)
-	r.OK = false
-	s.Notify(context.Background(), cert, r)
-	if calls != 5 {
-		t.Fatal("disabled notifications sent")
-	}
-}
-func TestSettingsAPI(t *testing.T) {
-	s, e := Open(filepath.Join(t.TempDir(), "settings.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close()
-	if e = s.ConfigureNotifications(SMTPConfig{TLSMode: "starttls", Port: 587}, false); e != nil {
-		t.Fatal(e)
-	}
-	router := s.Router("token", "")
-	r := httptest.NewRequest("PATCH", "/api/v1/settings", strings.NewReader(`{"auto_notify":true}`))
+func request(s *Service, method, path, body string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, path, strings.NewReader(body))
 	r.Header.Set("Authorization", "Bearer token")
 	r.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
-	router.ServeHTTP(w, r)
-	if w.Code != 400 {
-		t.Fatalf("missing SMTP enabled: %d", w.Code)
-	}
-	r = httptest.NewRequest("GET", "/api/v1/settings", nil)
-	r.Header.Set("Authorization", "Bearer token")
-	w = httptest.NewRecorder()
-	router.ServeHTTP(w, r)
-	if w.Code != 200 || strings.Contains(w.Body.String(), `"password":`) {
-		t.Fatal(w.Body.String())
-	}
+	s.Router("token", "*").ServeHTTP(w, r)
+	return w
 }
-
-func TestSMTPValidation(t *testing.T) {
-	c := SMTPConfig{Host: "smtp.example.com", Port: 465, TLSMode: "tls", From: "from@example.com", To: []string{"to@example.com"}}
-	if c.Validate() != nil {
-		t.Fatal("valid SMTP rejected")
-	}
-	c.From = "from@example.com\r\nBcc: bad@example.com"
-	if c.Validate() == nil {
-		t.Fatal("header injection accepted")
-	}
-}
-
-func TestSMTPSettingsPersistence(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "smtp.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { s.Close() }()
-	if err = s.ConfigureNotifications(SMTPConfig{Port: 587, TLSMode: "starttls"}, false); err != nil {
-		t.Fatal(err)
-	}
-	router := s.Router("token", "")
-	patch := func(body string) *httptest.ResponseRecorder {
-		r := httptest.NewRequest("PATCH", "/api/v1/settings", strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer token")
-		r.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, r)
-		return w
-	}
-	body := `{"auto_notify":true,"smtp":{"host":"smtp.example.com","port":465,"tls_mode":"tls","username":"user","password":"secret-value","from":"from@example.com","to":["a@example.com","b@example.com"]}}`
-	w := patch(body)
-	if w.Code != 200 || strings.Contains(w.Body.String(), "secret-value") || strings.Contains(w.Body.String(), `"password":`) {
-		t.Fatalf("save: %d %s", w.Code, w.Body.String())
-	}
-	if s.notify.config.Host != "smtp.example.com" || s.notify.config.Password != "secret-value" {
-		t.Fatal("live config not updated")
-	}
-	body = strings.Replace(body, `"password":"secret-value"`, `"password":""`, 1)
-	if w = patch(body); w.Code != 200 || s.notify.config.Password != "secret-value" {
-		t.Fatal("blank password did not preserve secret")
-	}
-	if w = patch(strings.Replace(body, `"port":465`, `"port":0`, 1)); w.Code != 400 {
-		t.Fatal("invalid SMTP accepted")
-	}
-	if w = patch(`{"auto_notify":false}`); w.Code != 200 {
-		t.Fatal(w.Body.String())
-	}
-	s.Close()
-	s, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = s.ConfigureNotifications(SMTPConfig{}, false); err != nil {
-		t.Fatal(err)
-	}
-	if s.notify.config.Password != "secret-value" || s.notify.config.Port != 465 {
-		t.Fatal("SMTP config lost on restart")
-	}
-	on, err := s.autoNotify()
-	if err != nil || on {
-		t.Fatal("notification toggle lost")
-	}
-	router = s.Router("token", "")
-	if w = patch(`{"smtp":{"host":"smtp.example.com","port":587,"tls_mode":"starttls","from":"from@example.com","to":["to@example.com"]},"clear_smtp_password":true}`); w.Code != 200 || s.notify.config.Password != "" {
-		t.Fatalf("clear password: %d %s", w.Code, w.Body.String())
-	}
-}
-
-func TestQueryToken(t *testing.T) {
-	s, e := Open(filepath.Join(t.TempDir(), "token.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close()
-	router := s.Router("secret-value", "*")
-	cases := []struct {
-		query, auth string
-		want        int
-	}{{"token=secret-value", "", 200}, {"token=wrong", "", 401}, {"", "", 401}, {"", "Bearer secret-value", 200}, {"token=secret-value", "Bearer wrong", 401}, {"token=wrong", "Bearer secret-value", 200}, {"token=secret-value&token=secret-value", "", 401}, {"token=secret-value", "Basic secret-value", 401}}
-	for _, tc := range cases {
-		r := httptest.NewRequest("GET", "/api/v1/projects?"+tc.query, nil)
-		r.Header.Set("Authorization", tc.auth)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, r)
-		if w.Code != tc.want {
-			t.Fatalf("%s %s: %d", tc.query, tc.auth, w.Code)
-		}
-		if strings.Contains(r.URL.RawQuery, "token") {
-			t.Fatal("token retained for logger")
-		}
-	}
-}
-
-func TestKindFiltersAndProjectDescription(t *testing.T) {
-	s, e := Open(filepath.Join(t.TempDir(), "filters.db"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close()
-	if e = s.Seed(); e != nil {
-		t.Fatal(e)
-	}
-	router := s.Router("token", "")
-	request := func(method, path, body string) (int, map[string]any) {
-		r := httptest.NewRequest(method, path, strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer token")
-		r.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, r)
-		var b map[string]any
-		json.Unmarshal(w.Body.Bytes(), &b)
-		return w.Code, b
-	}
-	code, b := request("GET", "/api/v1/status?kind=ssl&page_size=2", "")
-	if code != 200 || b["total"] != float64(3) || b["total_pages"] != float64(2) || len(b["data"].([]any)) != 2 {
-		t.Fatalf("filtered pages: %d %+v", code, b)
-	}
-	for _, v := range b["data"].([]any) {
-		if v.(map[string]any)["target"].(map[string]any)["kind"] != "ssl" {
-			t.Fatal("wrong kind")
-		}
-	}
-	code, b = request("GET", "/api/v1/projects/1/status?kind=ssl", "")
-	if code != 200 || b["total"] != float64(0) {
-		t.Fatal("project and kind not combined")
-	}
-	code, b = request("GET", "/api/v1/projects/4/targets?kind=ssl", "")
-	if code != 200 || len(b["data"].([]any)) != 3 {
-		t.Fatal("targets filter")
-	}
-	for _, path := range []string{"/api/v1/status?kind=nope", "/api/v1/status?kind=", "/api/v1/projects/1/targets?kind=http&kind=ssl"} {
-		if code, _ = request("GET", path, ""); code != 400 {
-			t.Fatalf("invalid kind: %s", path)
-		}
-	}
-	code, b = request("POST", "/api/v1/projects", `{"name":"new","description":"项目描述"}`)
-	if code != 201 || b["description"] != "项目描述" {
-		t.Fatalf("create: %+v", b)
-	}
-	pid := int(b["id"].(float64))
-	code, b = request("PATCH", fmt.Sprintf("/api/v1/projects/%d", pid), `{"description":"updated"}`)
-	if code != 200 || b["description"] != "updated" {
-		t.Fatal("description patch")
-	}
-	code, b = request("GET", "/api/v1/projects", "")
-	found := false
-	for _, v := range b["data"].([]any) {
-		p := v.(map[string]any)
-		if p["name"] == "new" && p["description"] == "updated" {
-			found = true
-		}
-	}
-	if code != 200 || !found {
-		t.Fatal("description not returned")
-	}
-	if code, _ = request("PATCH", "/api/v1/projects/99999", `{"description":"x"}`); code != 404 {
-		t.Fatal("missing project")
-	}
-	if code, _ = request("PATCH", fmt.Sprintf("/api/v1/projects/%d", pid), `{"description":""}`); code != 200 {
-		t.Fatal("cannot clear description")
-	}
-}
-func TestDescriptionMigration(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	db, e := sql.Open("sqlite", path)
-	if e != nil {
-		t.Fatal(e)
-	}
-	_, e = db.Exec(`CREATE TABLE projects(id INTEGER PRIMARY KEY,name TEXT NOT NULL UNIQUE);INSERT INTO projects(name)VALUES('existing');`)
-	db.Close()
-	if e != nil {
-		t.Fatal(e)
-	}
-	s, e := Open(path)
-	if e != nil {
-		t.Fatal(e)
-	}
-	var desc string
-	if e = s.db.QueryRow(`SELECT description FROM projects WHERE name='existing'`).Scan(&desc); e != nil || desc != "" {
-		t.Fatal("migration lost old project")
-	}
-	s.db.Exec(`UPDATE projects SET description='keep'`)
-	s.Close()
-	s, e = Open(path)
-	if e != nil {
-		t.Fatal(e)
-	}
-	defer s.Close()
-	if e = s.db.QueryRow(`SELECT description FROM projects WHERE name='existing'`).Scan(&desc); e != nil || desc != "keep" {
-		t.Fatal("repeated migration overwrote description")
-	}
-}
-
-func TestEmbeddedUI(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "ui.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	router := s.Router("test-token", "")
-	for path, content := range map[string]string{
-		"/ui/": "type=\"module\"", "/ui/app.js": "async function api", "/ui/expiry.js": "export function certificateExpiry", "/ui/style.css": "@media",
-	} {
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
-		if w.Code != 200 || !strings.Contains(w.Body.String(), content) {
-			t.Fatalf("%s: %d %s", path, w.Code, w.Body.String())
-		}
-	}
-	for _, path := range []string{"/?token=a%2Bb", "/ui?token=a%2Bb"} {
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
-		if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != "/ui/?token=a%2Bb" {
-			t.Fatalf("entry redirect: %d %s", w.Code, w.Header().Get("Location"))
-		}
-	}
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest("GET", "/ui/embed.go", nil))
-	if w.Code != 404 {
-		t.Fatalf("source exposed: %d", w.Code)
-	}
-}
-
-func TestWarningSettings(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "warning.db")
-	s, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { s.Close() }()
-	// Simulate a database created before configurable warning days existed.
-	if _, err = s.db.Exec(`CREATE TABLE service_settings(id INTEGER PRIMARY KEY,auto_notify INTEGER NOT NULL); INSERT INTO service_settings VALUES(1,0)`); err != nil {
-		t.Fatal(err)
-	}
-	if err = s.ConfigureNotifications(SMTPConfig{}, false); err != nil {
-		t.Fatal(err)
-	}
-	if s.notify.warningDays != 1 {
-		t.Fatal("default warning must be one day")
-	}
-	router := s.Router("token", "")
-	patch := func(body string) int {
-		r := httptest.NewRequest("PATCH", "/api/v1/settings", strings.NewReader(body))
-		r.Header.Set("Authorization", "Bearer token")
-		r.Header.Set("Content-Type", "application/json")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, r)
-		return w.Code
-	}
-	for _, body := range []string{`{"ssl_warning_days":0}`, `{"ssl_warning_days":366}`, `{"ssl_warning_days":1.5}`} {
-		if patch(body) != 400 {
-			t.Fatal("invalid days accepted")
-		}
-	}
-	if patch(`{"ssl_warning_days":7}`) != 200 || s.notify.warningDays != 7 {
-		t.Fatal("warning update failed")
-	}
-	days, err := s.sslWarningDays()
-	if err != nil || days != 7 {
-		t.Fatal("status warning not synchronized")
-	}
-	now := time.Now().Unix()
-	target := Target{Kind: "ssl"}
-	result := Result{OK: true, Expires: now + 2*86400}
-	if notificationKey(target, result, 1) != "healthy" || !strings.HasPrefix(notificationKey(target, result, 7), "expiry:") {
-		t.Fatal("configured warning threshold ignored")
-	}
-	result.Expires = now + 12*3600
-	if !strings.HasPrefix(notificationKey(target, result, 1), "expiry:") {
-		t.Fatal("one day warning missing")
-	}
-	s.Close()
-	s, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = s.ConfigureNotifications(SMTPConfig{}, false); err != nil || s.notify.warningDays != 7 {
-		t.Fatal("warning setting lost on restart")
-	}
-}
-
-func TestOptionalAuthentication(t *testing.T) {
-	s, err := Open(filepath.Join(t.TempDir(), "auth.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-	for _, enabled := range []bool{true, false} {
-		router := s.Router("token", "", enabled)
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest("GET", "/auth/config", nil))
-		var config struct {
-			Required bool `json:"auth_required"`
-		}
-		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &config) != nil || config.Required != enabled {
-			t.Fatal("auth configuration mismatch")
-		}
-		w = httptest.NewRecorder()
-		router.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/projects", nil))
-		expected := 200
-		if enabled {
-			expected = 401
-		}
-		if w.Code != expected {
-			t.Fatalf("auth enabled=%v status=%d", enabled, w.Code)
-		}
-	}
-	router := s.Router("", "", false)
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/projects", strings.NewReader(`{"name":"no-token"}`)))
+func createTarget(t *testing.T, s *Service, name, address string) Target {
+	t.Helper()
+	body := fmt.Sprintf(`{"name":%q,"kind":"http","address":%q,"description":"notes","interval_seconds":60}`, name, address)
+	w := request(s, "POST", "/api/v1/monitors", body)
 	if w.Code != 201 {
-		t.Fatalf("disabled authentication did not allow writes: %d", w.Code)
+		t.Fatal(w.Body.String())
+	}
+	var target Target
+	if json.Unmarshal(w.Body.Bytes(), &target) != nil {
+		t.Fatal("invalid response")
+	}
+	return target
+}
+func TestMonitorLifecycle(t *testing.T) {
+	s := testService(t)
+	target := createTarget(t, s, "service", "https://example.com/health")
+	if w := request(s, "PATCH", fmt.Sprintf("/api/v1/monitors/%d", target.ID), `{"name":"edited","description":"new","interval_seconds":120,"timeout_seconds":5,"enabled":false}`); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	updated, e := s.monitor(target.ID)
+	if e != nil || updated.Interval != 120 || updated.Enabled || updated.Description != "new" || updated.Name != "edited" {
+		t.Fatalf("edit: %+v %v", updated, e)
+	}
+	if w := request(s, "PATCH", fmt.Sprintf("/api/v1/monitors/%d", target.ID), `{"timeout_seconds":200}`); w.Code != 400 {
+		t.Fatal("invalid timeout accepted")
+	}
+	if e = s.Save(Result{TargetID: target.ID, At: time.Now().Unix(), OK: true, Latency: 20}); e != nil {
+		t.Fatal(e)
+	}
+	if w := request(s, "DELETE", fmt.Sprintf("/api/v1/monitors/%d", target.ID), ""); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	targets, e := s.Targets()
+	if e != nil || len(targets) != 0 {
+		t.Fatal("deleted monitor still visible")
+	}
+	if r, e := s.Latest(target.ID); e != nil || r == nil {
+		t.Fatal("history lost")
+	}
+	if w := request(s, "POST", "/api/v1/monitors", `{"name":"edited","kind":"ssl","address":"example.com","interval_seconds":86400}`); w.Code != 201 {
+		t.Fatal("deleted name cannot be reused")
+	}
+}
+func TestStatusTimelineAndAuth(t *testing.T) {
+	s := testService(t)
+	a := createTarget(t, s, "a", "https://example.com")
+	b := createTarget(t, s, "b", "https://example.com")
+	now := time.Now().Unix()
+	s.Save(Result{TargetID: a.ID, At: now, OK: true, Latency: 10})
+	s.Save(Result{TargetID: a.ID, At: now - 1, OK: false, Latency: 30})
+	s.Save(Result{TargetID: b.ID, At: now, OK: false})
+	s.scheduleMu.Lock()
+	s.schedule[a.ID] = scheduleEntry{Next: time.Now().Add(60 * time.Second)}
+	s.scheduleMu.Unlock()
+	w := request(s, "GET", "/api/v1/status?page_size=1", "")
+	var response struct {
+		Total   int            `json:"total"`
+		Summary map[string]int `json:"summary"`
+		Data    []struct {
+			Next int64 `json:"next_check_at"`
+		} `json:"data"`
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &response) != nil || response.Total != 2 || response.Summary["up"] != 1 || response.Summary["down"] != 1 || response.Data[0].Next <= now {
+		t.Fatal(w.Body.String())
+	}
+	w = request(s, "GET", fmt.Sprintf("/api/v1/monitors/timeline?ids=%d,%d", a.ID, b.ID), "")
+	var timeline struct {
+		Data []struct {
+			Samples, Successful int
+			Target              int64 `json:"target_id"`
+		}
+	}
+	if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &timeline) != nil {
+		t.Fatal(w.Body.String())
+	}
+	n := 0
+	for _, bucket := range timeline.Data {
+		n += bucket.Samples
+	}
+	if n != 3 {
+		t.Fatal("timeline sample count incorrect")
+	}
+	w = httptest.NewRecorder()
+	s.Router("token", "").ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/monitors", nil))
+	if w.Code != 401 {
+		t.Fatal("auth bypass")
+	}
+	w = httptest.NewRecorder()
+	s.Router("", "", false).ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/monitors", nil))
+	if w.Code != 200 {
+		t.Fatal("auth toggle ignored")
+	}
+	for _, path := range []string{"/ui/", "/ui/app.js", "/ui/expiry.js", "/ui/style.css"} {
+		w = request(s, "GET", path, "")
+		if w.Code != 200 {
+			t.Fatalf("asset %s: %d", path, w.Code)
+		}
+	}
+}
+func TestSettingsTestMailAndTemplate(t *testing.T) {
+	s := testService(t)
+	body := `{"ssl_warning_days":7,"auto_notify":false,"smtp":{"host":"smtp.example.com","port":587,"tls_mode":"starttls","username":"user","password":"secret-value","from":"from@example.com","to":["to@example.com"]}}`
+	w := request(s, "PATCH", "/api/v1/settings", body)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "secret-value") {
+		t.Fatal(w.Body.String())
+	}
+	s.notify.send = func(ctx context.Context, subject, body string) error {
+		if !strings.Contains(subject, "测试") {
+			t.Fatal("test subject missing")
+		}
+		return nil
+	}
+	if w = request(s, "POST", "/api/v1/settings/test-mail", ""); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	if w = request(s, "POST", "/api/v1/settings/test-mail", ""); w.Code != 429 {
+		t.Fatal("test mail not rate limited")
+	}
+	w = request(s, "PATCH", "/api/v1/settings", strings.Replace(body, `"password":"secret-value"`, `"password":""`, 1))
+	if w.Code != 200 || s.notify.config.Password != "secret-value" {
+		t.Fatal("blank password not retained")
+	}
+	if e := s.ConfigureNotifications(SMTPConfig{}, false); e != nil || s.notify.warningDays != 7 || s.notify.config.Password != "secret-value" {
+		t.Fatal("settings not persisted")
+	}
+	raw, e := buildEmail(s.notify.config, "[Babyone Check] down · 中文名称", "Target: <script>alert(1)</script>\nError: connection failed")
+	if e != nil {
+		t.Fatal(e)
+	}
+	msg, e := mail.ReadMessage(strings.NewReader(string(raw)))
+	if e != nil {
+		t.Fatal(e)
+	}
+	kind, params, e := mime.ParseMediaType(msg.Header.Get("Content-Type"))
+	if e != nil || kind != "multipart/alternative" {
+		t.Fatal("missing MIME alternatives")
+	}
+	parts := multipart.NewReader(msg.Body, params["boundary"])
+	count := 0
+	for {
+		part, e := parts.NextRawPart()
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			t.Fatal(e)
+		}
+		data, e := io.ReadAll(quotedprintable.NewReader(part))
+		if e != nil {
+			t.Fatal(e)
+		}
+		if strings.Contains(part.Header.Get("Content-Type"), "text/html") && (strings.Contains(string(data), "<script>") || !strings.Contains(string(data), "&lt;script&gt;")) {
+			t.Fatal("unescaped HTML template")
+		}
+		count++
+	}
+	if count != 2 {
+		t.Fatal("plain and HTML alternatives missing")
+	}
+}
+func TestSchedulerAndNotificationDedup(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) }))
+	defer server.Close()
+	s := testService(t)
+	target := createTarget(t, s, "local", server.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { s.Run(ctx); close(done) }()
+	defer func() { cancel(); <-done }()
+	deadline := time.Now().Add(4 * time.Second)
+	for {
+		result, e := s.Latest(target.ID)
+		if e != nil {
+			t.Fatal(e)
+		}
+		if result != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("scheduler did not check target")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	next, _ := s.scheduleStatus(target.ID)
+	if next <= time.Now().Unix() {
+		t.Fatal("next check not published")
+	}
+	cfg := SMTPConfig{Host: "smtp.example.com", Port: 587, TLSMode: "starttls", From: "a@example.com", To: []string{"b@example.com"}}
+	s.notify.mu.Lock()
+	s.notify.config = cfg
+	calls := 0
+	s.notify.send = func(context.Context, string, string) error { calls++; return nil }
+	s.db.Exec(`UPDATE service_settings SET auto_notify=1 WHERE id=1`)
+	s.notify.mu.Unlock()
+	result := Result{TargetID: target.ID, At: time.Now().Unix(), OK: false}
+	if e := s.Notify(context.Background(), target, result); e != nil {
+		t.Fatal(e)
+	}
+	s.Notify(context.Background(), target, result)
+	if calls != 1 {
+		t.Fatal("duplicate failure notification")
+	}
+	result.OK = true
+	s.Notify(context.Background(), target, result)
+	if calls != 2 {
+		t.Fatal("recovery notification missing")
+	}
+}
+func TestSeedOnceAndCertificateThresholds(t *testing.T) {
+	s := testService(t)
+	if e := s.Seed(); e != nil {
+		t.Fatal(e)
+	}
+	targets, _ := s.Targets()
+	if len(targets) != 6 {
+		t.Fatal("seed count")
+	}
+	request(s, "DELETE", fmt.Sprintf("/api/v1/monitors/%d", targets[0].ID), "")
+	if e := s.Seed(); e != nil {
+		t.Fatal(e)
+	}
+	targets, _ = s.Targets()
+	if len(targets) != 5 {
+		t.Fatal("deleted seed recreated")
+	}
+	target := Target{Kind: "ssl"}
+	r := Result{OK: true, Expires: time.Now().Add(2 * 24 * time.Hour).Unix()}
+	if notificationKey(target, r, 1) != "healthy" || !strings.HasPrefix(notificationKey(target, r, 7), "expiry:") {
+		t.Fatal("certificate notification threshold incorrect")
 	}
 }

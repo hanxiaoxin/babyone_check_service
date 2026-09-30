@@ -30,6 +30,7 @@ type notifier struct {
 	config      SMTPConfig
 	warningDays int
 	mu          sync.Mutex
+	lastTest    time.Time
 	send        func(context.Context, string, string) error
 }
 
@@ -118,8 +119,12 @@ func (c SMTPConfig) Send(ctx context.Context, subject, body string) error {
 	if e != nil {
 		return e
 	}
-	message := "From: " + c.From + "\r\nTo: " + strings.Join(c.To, ", ") + "\r\nSubject: " + subject + "\r\nMIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n" + strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\n", "\r\n")
-	if _, e = writer.Write([]byte(message)); e != nil {
+	message, e := buildEmail(c, subject, body)
+	if e != nil {
+		writer.Close()
+		return e
+	}
+	if _, e = writer.Write(message); e != nil {
 		writer.Close()
 		return e
 	}
@@ -208,6 +213,13 @@ func (s *Service) Notify(ctx context.Context, t Target, r Result) error {
 	if e != nil || !on {
 		return e
 	}
+	var active bool
+	if e = s.db.QueryRow(`SELECT enabled AND deleted=0 FROM targets WHERE id=?`, t.ID).Scan(&active); e != nil {
+		return e
+	}
+	if !active {
+		return nil
+	}
 	key := notificationKey(t, r, s.notify.warningDays)
 	var prior string
 	e = s.db.QueryRow(`SELECT state_key FROM notification_state WHERE target_id=?`, t.ID).Scan(&prior)
@@ -221,10 +233,20 @@ func (s *Service) Notify(ctx context.Context, t Target, r Result) error {
 		}
 		return nil
 	}
-	subject := "[Babyone Check] " + key + " target #" + strconv.FormatInt(t.ID, 10)
-	body := fmt.Sprintf("Project: %d\nTarget: %s\nAddress: %s\nState: %s\nChecked at: %s\nHTTP status: %d\nLatency: %d ms\nError: %s\n", t.ProjectID, t.Name, t.Address, key, time.Unix(r.At, 0).UTC().Format(time.RFC3339), r.Status, r.Latency, r.Error)
+	label := "服务恢复正常"
+	if key == "down" {
+		label = "服务检测异常"
+	} else if strings.HasPrefix(key, "expiry:") {
+		label = "证书即将到期"
+	}
+	subject := "[Babyone Check] " + label + " · " + strings.NewReplacer("\r", " ", "\n", " ").Replace(t.Name)
+	body := fmt.Sprintf("Target: %s\nAddress: %s\nState: %s\nChecked at: %s\nHTTP status: %d\nLatency: %d ms\nError: %s\n", t.Name, t.Address, label, time.Unix(r.At, 0).UTC().Format(time.RFC3339), r.Status, r.Latency, r.Error)
+	if t.Description != "" {
+		body += "Description: " + t.Description + "\n"
+	}
 	if r.Expires > 0 {
 		body += "Certificate expires: " + time.Unix(r.Expires, 0).UTC().Format(time.RFC3339) + "\n"
+		body += fmt.Sprintf("Remaining: %.1f 天\n", float64(r.Expires-time.Now().Unix())/86400)
 	}
 	e = s.notify.send(ctx, subject, body)
 	_, auditErr := s.db.Exec(`INSERT INTO notification_attempts(target_id,created_at,state_key,sent)VALUES(?,?,?,?)`, t.ID, time.Now().Unix(), key, e == nil)
@@ -250,6 +272,32 @@ func (s *Service) settingsResponse(on bool) gin.H {
 		"ssl_warning_days": s.notify.warningDays, "smtp": cfg, "smtp_password_set": hasPassword}
 }
 func (s *Service) configRoutes(a *gin.RouterGroup) {
+	a.POST("/settings/test-mail", func(c *gin.Context) {
+		if s.notify == nil {
+			fail(c, 503, "notifications not configured")
+			return
+		}
+		s.notify.mu.Lock()
+		if s.notify.config.Validate() != nil {
+			s.notify.mu.Unlock()
+			fail(c, 400, "save valid SMTP settings first")
+			return
+		}
+		if time.Since(s.notify.lastTest) < 30*time.Second {
+			s.notify.mu.Unlock()
+			fail(c, 429, "please wait 30 seconds before sending another test")
+			return
+		}
+		send := s.notify.send
+		s.notify.lastTest = time.Now()
+		s.notify.mu.Unlock()
+		body := "Target: SMTP 配置测试\nState: 测试通知，无需开启自动通知\nSent at: " + time.Now().UTC().Format(time.RFC3339) + "\n如果收到此邮件，说明当前 SMTP 配置可正常发送通知。"
+		if err := send(c.Request.Context(), "[Babyone Check] 测试邮件", body); err != nil {
+			fail(c, 502, "SMTP test failed; check server, TLS, credentials and recipients")
+			return
+		}
+		c.JSON(200, gin.H{"message": "test mail accepted by SMTP server"})
+	})
 	a.GET("/settings", func(c *gin.Context) {
 		if s.notify == nil {
 			fail(c, 503, "notifications not configured")
@@ -348,14 +396,4 @@ func (s *Service) configRoutes(a *gin.RouterGroup) {
 		s.notify.config, s.notify.send = cfg, cfg.Send
 		c.JSON(200, s.settingsResponse(on))
 	})
-}
-
-// Status pages also work before notifications are configured (e.g. API tests).
-func (s *Service) sslWarningDays() (int, error) {
-	if s.notify == nil {
-		return 1, nil
-	}
-	var days int
-	err := s.db.QueryRow(`SELECT days FROM ssl_warning_settings WHERE id=1`).Scan(&days)
-	return days, err
 }

@@ -23,7 +23,7 @@ func main() {
 	defer stop()
 	db := os.Getenv("DB_PATH")
 	if db == "" {
-		db = "monitor.db"
+		db = "monitor-v2.db"
 	}
 	s, err := monitor.Open(db)
 	if err != nil {

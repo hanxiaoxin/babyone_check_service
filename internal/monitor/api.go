@@ -46,7 +46,7 @@ func (s *Service) Router(token, origin string, authentication ...bool) *gin.Engi
 				c.Header("Vary", "Origin")
 			}
 			c.Header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-			c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
+			c.Header("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		}
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
@@ -88,141 +88,8 @@ func (s *Service) Router(token, origin string, authentication ...bool) *gin.Engi
 		c.Next()
 	})
 	s.configRoutes(a)
-	a.GET("/projects", func(c *gin.Context) {
-		rows, e := s.db.Query(`SELECT id,name,description FROM projects ORDER BY id`)
-		if e != nil {
-			fail(c, 500, "database error")
-			return
-		}
-		defer rows.Close()
-		out := []Project{}
-		for rows.Next() {
-			var p Project
-			if rows.Scan(&p.ID, &p.Name, &p.Description) != nil {
-				fail(c, 500, "database error")
-				return
-			}
-			out = append(out, p)
-		}
-		if rows.Err() != nil {
-			fail(c, 500, "database error")
-			return
-		}
-		c.JSON(200, gin.H{"data": out})
-	})
-	a.POST("/projects", func(c *gin.Context) {
-		var p Project
-		if c.ShouldBindJSON(&p) != nil || p.Name == "" || len(p.Name) > 100 || len(p.Description) > 2000 {
-			fail(c, 400, "name required, max 100 bytes; description max 2000 bytes")
-			return
-		}
-		res, e := s.db.Exec(`INSERT INTO projects(name,description)VALUES(?,?)`, p.Name, p.Description)
-		if e != nil {
-			fail(c, 409, "could not create project; name must be unique")
-			return
-		}
-		p.ID, _ = res.LastInsertId()
-		c.JSON(201, p)
-	})
-	a.PATCH("/projects/:project", func(c *gin.Context) {
-		pid := id(c, "project")
-		if pid == 0 {
-			return
-		}
-		var b struct {
-			Description *string `json:"description"`
-		}
-		if c.ShouldBindJSON(&b) != nil || b.Description == nil || len(*b.Description) > 2000 {
-			fail(c, 400, "description required, max 2000 bytes")
-			return
-		}
-		res, e := s.db.Exec(`UPDATE projects SET description=? WHERE id=?`, *b.Description, pid)
-		if e != nil {
-			fail(c, 500, "database error")
-			return
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			fail(c, 404, "project not found")
-			return
-		}
-		var p Project
-		if e = s.db.QueryRow(`SELECT id,name,description FROM projects WHERE id=?`, pid).Scan(&p.ID, &p.Name, &p.Description); e != nil {
-			fail(c, 500, "database error")
-			return
-		}
-		c.JSON(200, p)
-	})
-	a.GET("/projects/:project/targets", func(c *gin.Context) {
-		p := id(c, "project")
-		if p == 0 {
-			return
-		}
-		kind, ok := queryKind(c)
-		if !ok {
-			return
-		}
-		ts, e := s.Targets(p, kind)
-		if e != nil {
-			fail(c, 500, "database error")
-			return
-		}
-		c.JSON(200, gin.H{"data": ts})
-	})
-	a.POST("/projects/:project/targets", func(c *gin.Context) {
-		p := id(c, "project")
-		if p == 0 {
-			return
-		}
-		t := Target{Interval: 60, Timeout: 10, Expected: 200, Enabled: true}
-		if c.ShouldBindJSON(&t) != nil {
-			fail(c, 400, "invalid JSON")
-			return
-		}
-		t.ProjectID = p
-		if e := Validate(t); e != nil {
-			fail(c, 400, e.Error())
-			return
-		}
-		res, e := s.db.Exec(`INSERT INTO targets(project_id,name,kind,address,interval_seconds,timeout_seconds,expected_status,enabled)VALUES(?,?,?,?,?,?,?,?)`, p, t.Name, t.Kind, t.Address, t.Interval, t.Timeout, t.Expected, t.Enabled)
-		if e != nil {
-			fail(c, 409, "project missing or target name already exists")
-			return
-		}
-		t.ID, _ = res.LastInsertId()
-		c.JSON(201, t)
-	})
-	a.PATCH("/targets/:target", func(c *gin.Context) {
-		tid := id(c, "target")
-		if tid == 0 {
-			return
-		}
-		var body struct {
-			Enabled *bool `json:"enabled"`
-		}
-		if c.ShouldBindJSON(&body) != nil || body.Enabled == nil {
-			fail(c, 400, "enabled boolean required")
-			return
-		}
-		res, e := s.db.Exec(`UPDATE targets SET enabled=? WHERE id=?`, *body.Enabled, tid)
-		if e != nil {
-			fail(c, 500, "database error")
-			return
-		}
-		n, _ := res.RowsAffected()
-		if n == 0 {
-			fail(c, 404, "target not found")
-			return
-		}
-		c.JSON(200, gin.H{"id": tid, "enabled": *body.Enabled})
-	})
-	a.GET("/status", func(c *gin.Context) { s.statusPage(c, 0) })
-	a.GET("/projects/:project/status", func(c *gin.Context) {
-		p := id(c, "project")
-		if p > 0 {
-			s.statusPage(c, p)
-		}
-	})
+	s.monitorRoutes(a)
+	a.GET("/status", func(c *gin.Context) { s.statusPage(c) })
 	a.GET("/targets/:target/history", func(c *gin.Context) {
 		tid := id(c, "target")
 		if tid == 0 {
@@ -354,7 +221,7 @@ func window(c *gin.Context) (int64, int64, bool) {
 }
 
 // statusPage paginates targets in SQL rather than loading the entire inventory.
-func (s *Service) statusPage(c *gin.Context, project int64) {
+func (s *Service) statusPage(c *gin.Context) {
 	page, size := int64(1), int64(20)
 	for key, dst := range map[string]*int64{"page": &page, "page_size": &size} {
 		if value, exists := c.GetQuery(key); exists {
@@ -374,12 +241,8 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 	if !ok {
 		return
 	}
-	where := ""
+	where := " WHERE deleted=0"
 	args := []any{}
-	if project > 0 {
-		where = " WHERE project_id=?"
-		args = append(args, project)
-	}
 	if kind != "" {
 		if where == "" {
 			where = " WHERE kind=?"
@@ -400,7 +263,7 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		return
 	}
 	pageArgs := append(append([]any{}, args...), size, (page-1)*size)
-	rows, err := tx.QueryContext(c.Request.Context(), `SELECT id,project_id,name,kind,address,interval_seconds,timeout_seconds,expected_status,enabled FROM targets`+where+` ORDER BY id LIMIT ? OFFSET ?`, pageArgs...)
+	rows, err := tx.QueryContext(c.Request.Context(), `SELECT id,name,kind,address,interval_seconds,timeout_seconds,expected_status,enabled,description FROM targets`+where+` ORDER BY id LIMIT ? OFFSET ?`, pageArgs...)
 	if err != nil {
 		fail(c, 500, "database error")
 		return
@@ -408,7 +271,7 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 	targets := []Target{}
 	for rows.Next() {
 		var t Target
-		if err = rows.Scan(&t.ID, &t.ProjectID, &t.Name, &t.Kind, &t.Address, &t.Interval, &t.Timeout, &t.Expected, &t.Enabled); err != nil {
+		if err = rows.Scan(&t.ID, &t.Name, &t.Kind, &t.Address, &t.Interval, &t.Timeout, &t.Expected, &t.Enabled, &t.Description); err != nil {
 			rows.Close()
 			fail(c, 500, "database error")
 			return
@@ -441,7 +304,8 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 				state = "up"
 			}
 		}
-		v := gin.H{"target": t, "state": state, "latest": latest}
+		next, running := s.scheduleStatus(t.ID)
+		v := gin.H{"target": t, "state": state, "latest": latest, "next_check_at": next, "checking": running, "server_time": time.Now().Unix()}
 		if latest != nil && latest.Expires > 0 {
 			remaining := latest.Expires - time.Now().Unix()
 			v["expires_in_seconds"] = remaining
@@ -449,7 +313,18 @@ func (s *Service) statusPage(c *gin.Context, project int64) {
 		}
 		out = append(out, v)
 	}
-	c.JSON(200, gin.H{"data": out, "page": page, "page_size": size, "total": total, "total_pages": (total + size - 1) / size})
+	var up, down, unknown, paused int64
+	summaryArgs := append([]any{time.Now().Unix()}, args...)
+	summaryQuery := `SELECT COALESCE(SUM(state='up'),0),COALESCE(SUM(state='down'),0),COALESCE(SUM(state='unknown'),0),COALESCE(SUM(state='paused'),0) FROM (
+ SELECT CASE WHEN t.enabled=0 THEN 'paused' WHEN r.id IS NULL OR r.checked_at < ?-(t.interval_seconds*2+t.timeout_seconds) THEN 'unknown' WHEN r.ok=1 THEN 'up' ELSE 'down' END state
+ FROM targets t LEFT JOIN results r ON r.id=(SELECT id FROM results WHERE target_id=t.id ORDER BY checked_at DESC,id DESC LIMIT 1)`
+	summaryQuery += strings.ReplaceAll(strings.ReplaceAll(where, "deleted", "t.deleted"), "kind", "t.kind") + `)`
+	// Timestamp is the first placeholder in the SELECT, before filter arguments.
+	if err = s.db.QueryRow(summaryQuery, summaryArgs...).Scan(&up, &down, &unknown, &paused); err != nil {
+		fail(c, 500, "database error")
+		return
+	}
+	c.JSON(200, gin.H{"data": out, "page": page, "page_size": size, "total": total, "total_pages": (total + size - 1) / size, "summary": gin.H{"up": up, "down": down, "unknown": unknown, "paused": paused}})
 }
 
 func queryKind(c *gin.Context) (string, bool) {
