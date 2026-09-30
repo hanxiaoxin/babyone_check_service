@@ -4,13 +4,13 @@ import (
 	"context"
 	"crypto/tls"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"net"
 	"net/mail"
 	"net/smtp"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,11 +18,13 @@ import (
 )
 
 type SMTPConfig struct {
-	Host                     string
-	Port                     int
-	Username, Password, From string
-	To                       []string
-	TLSMode                  string
+	Host     string   `json:"host"`
+	Port     int      `json:"port"`
+	Username string   `json:"username"`
+	Password string   `json:"password,omitempty"`
+	From     string   `json:"from"`
+	To       []string `json:"to"`
+	TLSMode  string   `json:"tls_mode"`
 }
 type notifier struct {
 	config SMTPConfig
@@ -30,31 +32,9 @@ type notifier struct {
 	send   func(context.Context, string, string) error
 }
 
-func SMTPFromEnv() (SMTPConfig, error) {
-	c := SMTPConfig{Host: os.Getenv("SMTP_HOST"), Port: 587, Username: os.Getenv("SMTP_USERNAME"), Password: os.Getenv("SMTP_PASSWORD"), From: os.Getenv("SMTP_FROM"), TLSMode: os.Getenv("SMTP_TLS_MODE")}
-	if c.TLSMode == "" {
-		c.TLSMode = "starttls"
-	}
-	if v := os.Getenv("SMTP_PORT"); v != "" {
-		n, e := strconv.Atoi(v)
-		if e != nil || n < 1 || n > 65535 {
-			return c, fmt.Errorf("invalid SMTP_PORT")
-		}
-		c.Port = n
-	}
-	for _, v := range strings.Split(os.Getenv("SMTP_TO"), ",") {
-		if v = strings.TrimSpace(v); v != "" {
-			c.To = append(c.To, v)
-		}
-	}
-	if c.TLSMode != "starttls" && c.TLSMode != "tls" {
-		return c, fmt.Errorf("SMTP_TLS_MODE must be starttls or tls")
-	}
-	return c, nil
-}
 func (c SMTPConfig) Validate() error {
 	if c.Host == "" || strings.ContainsAny(c.Host, "\r\n /:") || c.Port < 1 || c.Port > 65535 {
-		return fmt.Errorf("SMTP_HOST and valid SMTP_PORT required")
+		return fmt.Errorf("SMTP server and valid port required")
 	}
 	if c.TLSMode != "starttls" && c.TLSMode != "tls" {
 		return fmt.Errorf("TLS mode invalid")
@@ -69,10 +49,10 @@ func (c SMTPConfig) Validate() error {
 		}
 	}
 	if len(c.To) == 0 {
-		return fmt.Errorf("SMTP_TO required")
+		return fmt.Errorf("at least one recipient required")
 	}
 	if (c.Username == "") != (c.Password == "") {
-		return fmt.Errorf("SMTP_USERNAME and SMTP_PASSWORD must both be configured")
+		return fmt.Errorf("SMTP username and password must both be configured")
 	}
 	return nil
 }
@@ -157,6 +137,7 @@ func (s *Service) ConfigureNotifications(c SMTPConfig, initial bool) error {
 	}
 	s.notify = &notifier{config: c, send: c.Send}
 	_, e := s.db.Exec(`CREATE TABLE IF NOT EXISTS service_settings(id INTEGER PRIMARY KEY CHECK(id=1),auto_notify INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS smtp_settings(id INTEGER PRIMARY KEY CHECK(id=1),config TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS notification_state(target_id INTEGER PRIMARY KEY REFERENCES targets(id),state_key TEXT NOT NULL);
  CREATE TABLE IF NOT EXISTS notification_attempts(id INTEGER PRIMARY KEY,target_id INTEGER NOT NULL,created_at INTEGER NOT NULL,state_key TEXT NOT NULL,sent INTEGER NOT NULL);`)
 	if e != nil {
@@ -166,15 +147,37 @@ func (s *Service) ConfigureNotifications(c SMTPConfig, initial bool) error {
 	if e != nil {
 		return e
 	}
-	enabled, e := s.autoNotify()
-	if e != nil {
-		return e
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return err
 	}
-	if enabled {
-		return c.Validate()
+	if _, err = s.db.Exec(`INSERT OR IGNORE INTO smtp_settings(id,config)VALUES(1,?)`, string(raw)); err != nil {
+		return err
 	}
-	return nil
+	if err = s.db.QueryRow(`SELECT config FROM smtp_settings WHERE id=1`).Scan(&raw); err != nil {
+		return err
+	}
+	if err = json.Unmarshal(raw, &c); err != nil {
+		return err
+	}
+	if c.Port == 0 {
+		c.Port = 587
+	}
+	if c.TLSMode == "" {
+		c.TLSMode = "starttls"
+	}
+	s.notify.config, s.notify.send = c, c.Send
+	enabled, err := s.autoNotify()
+	if err != nil {
+		return err
+	}
+	// Old installations may have enabled notifications before configuring SMTP in the UI.
+	if enabled && c.Validate() != nil {
+		_, err = s.db.Exec(`UPDATE service_settings SET auto_notify=0 WHERE id=1`)
+	}
+	return err
 }
+
 func (s *Service) autoNotify() (bool, error) {
 	var on bool
 	e := s.db.QueryRow(`SELECT auto_notify FROM service_settings WHERE id=1`).Scan(&on)
@@ -228,18 +231,32 @@ func (s *Service) Notify(ctx context.Context, t Target, r Result) error {
 	_, e = s.db.Exec(`INSERT INTO notification_state(target_id,state_key)VALUES(?,?) ON CONFLICT(target_id) DO UPDATE SET state_key=excluded.state_key`, t.ID, key)
 	return e
 }
+
+// settingsResponse never returns the stored SMTP password.
+func (s *Service) settingsResponse(on bool) gin.H {
+	cfg := s.notify.config
+	hasPassword := cfg.Password != ""
+	cfg.Password = ""
+	if cfg.To == nil {
+		cfg.To = []string{}
+	}
+	return gin.H{"auto_notify": on, "smtp_configured": s.notify.config.Validate() == nil,
+		"ssl_warning_days": 30, "smtp": cfg, "smtp_password_set": hasPassword}
+}
 func (s *Service) configRoutes(a *gin.RouterGroup) {
 	a.GET("/settings", func(c *gin.Context) {
 		if s.notify == nil {
 			fail(c, 503, "notifications not configured")
 			return
 		}
-		on, e := s.autoNotify()
-		if e != nil {
+		s.notify.mu.Lock()
+		defer s.notify.mu.Unlock()
+		on, err := s.autoNotify()
+		if err != nil {
 			fail(c, 500, "database error")
 			return
 		}
-		c.JSON(200, gin.H{"auto_notify": on, "smtp_configured": s.notify.config.Validate() == nil, "ssl_warning_days": 30})
+		c.JSON(200, s.settingsResponse(on))
 	})
 	a.PATCH("/settings", func(c *gin.Context) {
 		if s.notify == nil {
@@ -247,25 +264,69 @@ func (s *Service) configRoutes(a *gin.RouterGroup) {
 			return
 		}
 		var b struct {
-			AutoNotify *bool `json:"auto_notify"`
+			AutoNotify    *bool       `json:"auto_notify"`
+			SMTP          *SMTPConfig `json:"smtp"`
+			ClearPassword bool        `json:"clear_smtp_password"`
 		}
-		if c.ShouldBindJSON(&b) != nil || b.AutoNotify == nil {
-			fail(c, 400, "auto_notify boolean required")
+		if c.ShouldBindJSON(&b) != nil || (b.AutoNotify == nil && b.SMTP == nil && !b.ClearPassword) {
+			fail(c, 400, "auto_notify or smtp settings required")
 			return
 		}
-		if *b.AutoNotify {
-			if s.notify.config.Validate() != nil {
-				fail(c, 400, "configure valid SMTP settings in .env first")
-				return
-			}
-		}
 		s.notify.mu.Lock()
-		_, e := s.db.Exec(`UPDATE service_settings SET auto_notify=? WHERE id=1`, *b.AutoNotify)
-		s.notify.mu.Unlock()
-		if e != nil {
+		defer s.notify.mu.Unlock()
+		on, err := s.autoNotify()
+		if err != nil {
 			fail(c, 500, "database error")
 			return
 		}
-		c.JSON(200, gin.H{"auto_notify": *b.AutoNotify})
+		if b.AutoNotify != nil {
+			on = *b.AutoNotify
+		}
+		cfg := s.notify.config
+		if b.SMTP != nil {
+			cfg = *b.SMTP
+			cfg.Host = strings.TrimSpace(cfg.Host)
+			cfg.Username = strings.TrimSpace(cfg.Username)
+			cfg.From = strings.TrimSpace(cfg.From)
+			cfg.To = append([]string(nil), cfg.To...)
+			for i := range cfg.To {
+				cfg.To[i] = strings.TrimSpace(cfg.To[i])
+			}
+			if cfg.Password == "" {
+				cfg.Password = s.notify.config.Password
+			}
+		}
+		if b.ClearPassword {
+			cfg.Password = ""
+		}
+		if b.SMTP != nil || b.ClearPassword || on {
+			if err = cfg.Validate(); err != nil {
+				fail(c, 400, err.Error())
+				return
+			}
+		}
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			fail(c, 500, "configuration error")
+			return
+		}
+		tx, err := s.db.BeginTx(c.Request.Context(), nil)
+		if err != nil {
+			fail(c, 500, "database error")
+			return
+		}
+		defer tx.Rollback()
+		if _, err = tx.Exec(`UPDATE service_settings SET auto_notify=? WHERE id=1`, on); err == nil {
+			_, err = tx.Exec(`UPDATE smtp_settings SET config=? WHERE id=1`, string(raw))
+		}
+		if err == nil {
+			err = tx.Commit()
+		}
+		if err != nil {
+			fail(c, 500, "database error")
+			return
+		}
+		s.notify.config, s.notify.send = cfg, cfg.Send
+		c.JSON(200, s.settingsResponse(on))
 	})
 }

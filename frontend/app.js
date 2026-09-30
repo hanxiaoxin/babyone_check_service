@@ -9,7 +9,7 @@ const tokens = url.searchParams.getAll('token');
 url.searchParams.delete('token');
 history.replaceState(null, '', url.pathname + url.search + url.hash);
 function message(text = '', error = false) { $('message').textContent = text; $('message').className = error ? 'error' : ''; }
-function disconnect() { token = ''; version++; historyVersion++; $('history').close(); $('workspace').hidden = true; $('login').hidden = false; $('logout').hidden = true; $('login-form').reset(); $('targets').replaceChildren(); $('project-list').replaceChildren(); }
+function disconnect() { token = ''; version++; historyVersion++; $('history').close(); $('workspace').hidden = true; $('login').hidden = false; $('logout').hidden = true; $('login-form').reset(); $('settings-form').reset(); $('targets').replaceChildren(); $('project-list').replaceChildren(); }
 async function api(path, method = 'GET', body) {
  const response = await fetch('/api/v1' + path, {method, headers:{Authorization:'Bearer ' + token, ...(body ? {'Content-Type':'application/json'} : {})}, ...(body ? {body:JSON.stringify(body)} : {}), cache:'no-store'});
  const data = await response.json();
@@ -68,7 +68,16 @@ async function loadStatus() {
  }
  if (!data.data.length) $('targets').append(el('p','暂无检测目标，可在项目管理中添加。'));
 }
-async function loadSettings() { const s = await api('/settings'); $('smtp-status').textContent = `SMTP ${s.smtp_configured ? '已配置' : '未配置'} · 证书提前 ${s.ssl_warning_days} 天预警`; $('settings-form').elements.auto_notify.checked = s.auto_notify; $('settings-form').elements.auto_notify.disabled = !s.smtp_configured && !s.auto_notify; }
+async function loadSettings() {
+ const s = await api('/settings'), f = $('settings-form').elements;
+ $('smtp-status').textContent = `SMTP ${s.smtp_configured ? '已配置' : '未配置'} · 证书提前 ${s.ssl_warning_days} 天预警`;
+ for (const key of ['host','port','tls_mode','username','from']) f[key].value = s.smtp[key] ?? '';
+ f.to.value = (s.smtp.to || []).join(', ');
+ f.password.value = ''; f.clear_password.checked = false;
+ f.auto_notify.checked = s.auto_notify;
+ $('smtp-password-status').textContent = s.smtp_password_set ? '已保存密码，留空保持原值' : '尚未设置密码';
+}
+
 async function openHistory(t) { historyTarget = t; $('history-title').textContent = t.name + ' · 检测历史'; if (!$('history').open) $('history').showModal(); await resetHistory(); }
 async function resetHistory() {
  const current = ++historyVersion;
@@ -98,7 +107,12 @@ $('project-form').onsubmit=e=>{e.preventDefault();run(async()=>{ const form=e.ta
 const targetForm = $('target-form');
 targetForm.elements.kind.onchange = () => { const ssl=targetForm.elements.kind.value==='ssl'; targetForm.elements.interval_seconds.value=ssl?86400:60; targetForm.elements.address.placeholder=ssl?'example.com（仅域名）':'https://example.com/health'; $('expected-label').hidden=ssl; };
 targetForm.onsubmit=e=>{e.preventDefault();run(async()=>{const form=e.target, f=form.elements; const body={name:f.name.value.trim(),kind:f.kind.value,address:f.address.value.trim(),interval_seconds:Number(f.interval_seconds.value),timeout_seconds:Number(f.timeout_seconds.value),expected_status:Number(f.expected_status.value),enabled:true}; checkBytes(body.name,100,'名称'); if(body.timeout_seconds>=body.interval_seconds) throw new Error('超时必须小于检测间隔'); await api(`/projects/${f.project.value}/targets`,'POST',body); f.name.value=''; f.address.value=''; page=1; await loadStatus(); message('检测目标已添加');},e.submitter);};
-$('settings-form').onsubmit=e=>{e.preventDefault();run(async()=>{await api('/settings','PATCH',{auto_notify:e.target.elements.auto_notify.checked}); await loadSettings(); message('通知设置已保存');},e.submitter);};
+$('settings-form').onsubmit=e=>{e.preventDefault();run(async()=>{
+ const f=e.target.elements;
+ const smtp={host:f.host.value.trim(),port:Number(f.port.value),tls_mode:f.tls_mode.value,username:f.username.value.trim(),password:f.password.value,from:f.from.value.trim(),to:f.to.value.split(/[,，\n]/).map(v=>v.trim()).filter(Boolean)};
+ await api('/settings','PATCH',{auto_notify:f.auto_notify.checked,smtp,clear_smtp_password:f.clear_password.checked});
+ f.password.value=''; await loadSettings(); message('通知设置已保存，立即生效');
+},e.submitter);};
 $('close-history').onclick=()=>{historyVersion++;$('history').close();};
 $('history').addEventListener('close',()=>historyVersion++);
 $('history-range').onchange=()=>run(resetHistory);

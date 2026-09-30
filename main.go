@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 )
@@ -32,18 +31,7 @@ func main() {
 	if err = s.Seed(); err != nil {
 		log.Fatal(err)
 	}
-	smtpConfig, err := monitor.SMTPFromEnv()
-	if err != nil {
-		log.Fatal(err)
-	}
-	initialNotify := false
-	if value := os.Getenv("AUTO_NOTIFY"); value != "" {
-		initialNotify, err = strconv.ParseBool(value)
-		if err != nil {
-			log.Fatal("AUTO_NOTIFY must be true or false")
-		}
-	}
-	if err = s.ConfigureNotifications(smtpConfig, initialNotify); err != nil {
+	if err = s.ConfigureNotifications(monitor.SMTPConfig{Port: 587, TLSMode: "starttls"}, false); err != nil {
 		log.Fatal(err)
 	}
 	token := os.Getenv("API_TOKEN")

@@ -8,13 +8,13 @@ Go + Gin + SQLite 服务可用性与 SSL 证书监测，内置无需编译的原
 
 ```bash
 cp .env.example .env
-# 至少设置 API_TOKEN；邮件通知填写 SMTP_*。
+# 至少设置 API_TOKEN。
 go run .
 ```
 
 访问 `http://服务器IP:8080/ui/`，输入 API Token；也支持 `/ui/?token=你的Token`。页面连接后移除地址栏中的 token，仅在内存中保存，刷新需要重新输入。前端资源通过 embed 打包进 Go 二进制，无需 npm 或额外部署。
 
-默认监听 `0.0.0.0:8080`，数据库为 `monitor.db`。`.env` 可配置 `LISTEN_ADDR`、`DB_PATH`、`API_TOKEN`、`CORS_ORIGIN`（`*` 允许所有来源）及 SMTP；修改后重启。运行时通知开关保存在 SQLite。
+默认监听 `0.0.0.0:8080`，数据库为 `monitor.db`。`.env` 可配置 `LISTEN_ADDR`、`DB_PATH`、`API_TOKEN`、`CORS_ORIGIN`（`*` 允许所有来源）；修改后重启。SMTP 与通知开关在网页“通知设置”中配置，保存在 SQLite，保存后立即生效。密码不回显，留空保留，勾选清除可删除；多个收件人用逗号分隔。数据库包含 SMTP 密码，请保护数据库及备份文件。旧 .env 中的 SMTP_* 不再读取，升级后需在网页重新配置；未配置时自动通知关闭。
 
 页面支持项目描述、HTTP/SSL 筛选、状态分页、创建项目和检测目标、暂停/恢复、历史分页、时间范围统计及通知开关。启动时自动创建内置项目与检测目标。单进程使用本地 SQLite。
 
@@ -32,7 +32,7 @@ go run .
 | GET | `/api/v1/status`、`/api/v1/projects/:id/status` | 状态分页 |
 | GET | `/api/v1/targets/:id/history` | 检测历史 |
 | GET | `/api/v1/targets/:id/stats` | 样本成功率及平均延迟 |
-| GET/PATCH | `/api/v1/settings` | 查询配置/设置 auto_notify |
+| GET/PATCH | `/api/v1/settings` | 查询/保存 SMTP 与通知开关 |
 
 目标及状态列表支持 `kind=http/ssl`，不传查询全部。状态分页使用 `page`、`page_size`（最大 100）。历史和统计使用 Unix 秒 `from`、`to`，默认 24 小时、最大 366 天；历史使用 `limit` 与返回的 `next_before_id` 作为下一次 `before_id`。
 

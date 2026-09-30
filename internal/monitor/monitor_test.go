@@ -230,30 +230,77 @@ func TestSettingsAPI(t *testing.T) {
 	r.Header.Set("Authorization", "Bearer token")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, r)
-	if w.Code != 200 || strings.Contains(w.Body.String(), "password") {
+	if w.Code != 200 || strings.Contains(w.Body.String(), `"password":`) {
 		t.Fatal(w.Body.String())
 	}
 }
 
-func TestSMTPEnvironment(t *testing.T) {
-	t.Setenv("SMTP_HOST", "smtp.example.com")
-	t.Setenv("SMTP_PORT", "465")
-	t.Setenv("SMTP_TLS_MODE", "tls")
-	t.Setenv("SMTP_FROM", "from@example.com")
-	t.Setenv("SMTP_TO", "a@example.com, b@example.com")
-	t.Setenv("SMTP_USERNAME", "user")
-	t.Setenv("SMTP_PASSWORD", "secret")
-	c, e := SMTPFromEnv()
-	if e != nil || c.Port != 465 || len(c.To) != 2 || c.Validate() != nil {
-		t.Fatalf("SMTP parse: %+v %v", c, e)
+func TestSMTPValidation(t *testing.T) {
+	c := SMTPConfig{Host: "smtp.example.com", Port: 465, TLSMode: "tls", From: "from@example.com", To: []string{"to@example.com"}}
+	if c.Validate() != nil {
+		t.Fatal("valid SMTP rejected")
 	}
 	c.From = "from@example.com\r\nBcc: bad@example.com"
 	if c.Validate() == nil {
 		t.Fatal("header injection accepted")
 	}
-	t.Setenv("SMTP_PORT", "invalid")
-	if _, e = SMTPFromEnv(); e == nil {
-		t.Fatal("bad port accepted")
+}
+
+func TestSMTPSettingsPersistence(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "smtp.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { s.Close() }()
+	if err = s.ConfigureNotifications(SMTPConfig{Port: 587, TLSMode: "starttls"}, false); err != nil {
+		t.Fatal(err)
+	}
+	router := s.Router("token", "")
+	patch := func(body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("PATCH", "/api/v1/settings", strings.NewReader(body))
+		r.Header.Set("Authorization", "Bearer token")
+		r.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, r)
+		return w
+	}
+	body := `{"auto_notify":true,"smtp":{"host":"smtp.example.com","port":465,"tls_mode":"tls","username":"user","password":"secret-value","from":"from@example.com","to":["a@example.com","b@example.com"]}}`
+	w := patch(body)
+	if w.Code != 200 || strings.Contains(w.Body.String(), "secret-value") || strings.Contains(w.Body.String(), `"password":`) {
+		t.Fatalf("save: %d %s", w.Code, w.Body.String())
+	}
+	if s.notify.config.Host != "smtp.example.com" || s.notify.config.Password != "secret-value" {
+		t.Fatal("live config not updated")
+	}
+	body = strings.Replace(body, `"password":"secret-value"`, `"password":""`, 1)
+	if w = patch(body); w.Code != 200 || s.notify.config.Password != "secret-value" {
+		t.Fatal("blank password did not preserve secret")
+	}
+	if w = patch(strings.Replace(body, `"port":465`, `"port":0`, 1)); w.Code != 400 {
+		t.Fatal("invalid SMTP accepted")
+	}
+	if w = patch(`{"auto_notify":false}`); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	s.Close()
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.ConfigureNotifications(SMTPConfig{}, false); err != nil {
+		t.Fatal(err)
+	}
+	if s.notify.config.Password != "secret-value" || s.notify.config.Port != 465 {
+		t.Fatal("SMTP config lost on restart")
+	}
+	on, err := s.autoNotify()
+	if err != nil || on {
+		t.Fatal("notification toggle lost")
+	}
+	router = s.Router("token", "")
+	if w = patch(`{"smtp":{"host":"smtp.example.com","port":587,"tls_mode":"starttls","from":"from@example.com","to":["to@example.com"]},"clear_smtp_password":true}`); w.Code != 200 || s.notify.config.Password != "" {
+		t.Fatalf("clear password: %d %s", w.Code, w.Body.String())
 	}
 }
 
