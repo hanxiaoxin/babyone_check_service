@@ -33,7 +33,7 @@ func main() {
 	if err = s.Seed(); err != nil {
 		log.Fatal(err)
 	}
-	if err = s.ConfigureNotifications(monitor.SMTPConfig{Port: 587, TLSMode: "starttls"}, false); err != nil {
+	if err = s.ConfigureNotifications(monitor.SMTPConfig{Port: 465, TLSMode: "tls"}, false); err != nil {
 		log.Fatal(err)
 	}
 	authEnabled := true

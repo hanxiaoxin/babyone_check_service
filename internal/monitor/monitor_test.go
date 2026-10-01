@@ -136,6 +136,25 @@ func TestStatusTimelineAndAuth(t *testing.T) {
 		}
 	}
 }
+func TestSettingsTestMailFailureReturnsDetailAndCanRetry(t *testing.T) {
+	s := testService(t)
+	body := `{"ssl_warning_days":7,"auto_notify":false,"smtp":{"host":"smtp.example.com","port":587,"tls_mode":"starttls","username":"user","password":"secret-value","from":"from@example.com","to":["to@example.com"]}}`
+	if w := request(s, "PATCH", "/api/v1/settings", body); w.Code != 200 {
+		t.Fatal(w.Body.String())
+	}
+	s.notify.send = func(context.Context, string, string) error {
+		return fmt.Errorf("SMTP authentication: 535 authorization failed\nsecret omitted")
+	}
+	w := request(s, "POST", "/api/v1/settings/test-mail", "")
+	if w.Code != 502 || !strings.Contains(w.Body.String(), "535 authorization failed") || strings.Contains(w.Body.String(), "\n") || !strings.Contains(w.Body.String(), `"password_length":12`) || !strings.Contains(w.Body.String(), `"username":"user"`) || strings.Contains(w.Body.String(), "secret-value") {
+		t.Fatal(w.Body.String())
+	}
+	s.notify.send = func(context.Context, string, string) error { return nil }
+	if w = request(s, "POST", "/api/v1/settings/test-mail", ""); w.Code != 200 {
+		t.Fatalf("failed test should not start rate limit: %s", w.Body.String())
+	}
+}
+
 func TestSettingsTestMailAndTemplate(t *testing.T) {
 	s := testService(t)
 	body := `{"ssl_warning_days":7,"auto_notify":false,"smtp":{"host":"smtp.example.com","port":587,"tls_mode":"starttls","username":"user","password":"secret-value","from":"from@example.com","to":["to@example.com"]}}`

@@ -68,9 +68,10 @@ func (c SMTPConfig) Send(ctx context.Context, subject, body string) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	deadline, _ := ctx.Deadline()
-	conn, e := (&net.Dialer{}).DialContext(ctx, "tcp", net.JoinHostPort(c.Host, strconv.Itoa(c.Port)))
+	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.Port))
+	conn, e := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	if e != nil {
-		return e
+		return fmt.Errorf("connect %s: %w", addr, e)
 	}
 	defer conn.Close()
 	conn.SetDeadline(deadline)
@@ -88,36 +89,39 @@ func (c SMTPConfig) Send(ctx context.Context, subject, body string) error {
 	if c.TLSMode == "tls" {
 		tc := tls.Client(conn, cfg)
 		if e = tc.HandshakeContext(ctx); e != nil {
-			return e
+			return fmt.Errorf("TLS handshake: %w", e)
 		}
 		wire = tc
 	}
 	client, e := smtp.NewClient(wire, c.Host)
 	if e != nil {
-		return e
+		return fmt.Errorf("SMTP handshake: %w", e)
 	}
 	defer client.Close()
 	if c.TLSMode == "starttls" {
+		if ok, _ := client.Extension("STARTTLS"); !ok {
+			return fmt.Errorf("STARTTLS: server does not advertise STARTTLS; use TLS mode for implicit TLS ports such as 465")
+		}
 		if e = client.StartTLS(cfg); e != nil {
-			return e
+			return fmt.Errorf("STARTTLS: %w", e)
 		}
 	}
 	if c.Username != "" {
 		if e = client.Auth(smtp.PlainAuth("", c.Username, c.Password, c.Host)); e != nil {
-			return e
+			return fmt.Errorf("SMTP authentication: %w", e)
 		}
 	}
 	if e = client.Mail(c.From); e != nil {
-		return e
+		return fmt.Errorf("MAIL FROM %s: %w", c.From, e)
 	}
 	for _, to := range c.To {
 		if e = client.Rcpt(to); e != nil {
-			return e
+			return fmt.Errorf("RCPT TO %s: %w", to, e)
 		}
 	}
 	writer, e := client.Data()
 	if e != nil {
-		return e
+		return fmt.Errorf("SMTP DATA: %w", e)
 	}
 	message, e := buildEmail(c, subject, body)
 	if e != nil {
@@ -126,15 +130,44 @@ func (c SMTPConfig) Send(ctx context.Context, subject, body string) error {
 	}
 	if _, e = writer.Write(message); e != nil {
 		writer.Close()
-		return e
+		return fmt.Errorf("write message: %w", e)
 	}
 	if e = writer.Close(); e != nil {
-		return e
+		return fmt.Errorf("SMTP DATA acknowledgement: %w", e)
 	}
 	// DATA acknowledgement confirms acceptance; QUIT failure must not trigger a duplicate retry.
 	_ = client.Quit()
 	return nil
 }
+func smtpDebugInfo(c SMTPConfig) gin.H {
+	return gin.H{
+		"host":            c.Host,
+		"port":            c.Port,
+		"tls_mode":        c.TLSMode,
+		"username":        c.Username,
+		"username_length": len(c.Username),
+		"password_set":    c.Password != "",
+		"password_length": len(c.Password),
+		"from":            c.From,
+		"to":              append([]string(nil), c.To...),
+	}
+}
+
+func smtpPublicError(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	msg := strings.TrimSpace(err.Error())
+	// SMTP server replies and network/TLS errors are useful for diagnosing settings,
+	// but keep the API response single-line and bounded.
+	msg = strings.NewReplacer("\r", " ", "\n", " ", "\t", " ").Replace(msg)
+	msg = strings.Join(strings.Fields(msg), " ")
+	if len(msg) > 500 {
+		msg = msg[:500] + "…"
+	}
+	return msg
+}
+
 func (s *Service) ConfigureNotifications(c SMTPConfig, initial bool) error {
 	if initial {
 		if e := c.Validate(); e != nil {
@@ -169,10 +202,10 @@ func (s *Service) ConfigureNotifications(c SMTPConfig, initial bool) error {
 		return err
 	}
 	if c.Port == 0 {
-		c.Port = 587
+		c.Port = 465
 	}
 	if c.TLSMode == "" {
-		c.TLSMode = "starttls"
+		c.TLSMode = "tls"
 	}
 	if err = s.db.QueryRow(`SELECT days FROM ssl_warning_settings WHERE id=1`).Scan(&s.notify.warningDays); err != nil {
 		return err
@@ -289,13 +322,20 @@ func (s *Service) configRoutes(a *gin.RouterGroup) {
 			return
 		}
 		send := s.notify.send
-		s.notify.lastTest = time.Now()
+		cfg := s.notify.config
 		s.notify.mu.Unlock()
 		body := "Target: SMTP 配置测试\nState: 测试通知，无需开启自动通知\nSent at: " + time.Now().UTC().Format(time.RFC3339) + "\n如果收到此邮件，说明当前 SMTP 配置可正常发送通知。"
 		if err := send(c.Request.Context(), "[Babyone Check] 测试邮件", body); err != nil {
-			fail(c, 502, "SMTP test failed; check server, TLS, credentials and recipients")
+			msg := "SMTP 测试失败：" + smtpPublicError(err)
+			if strings.Contains(strings.ToLower(err.Error()), "authentication") || strings.Contains(err.Error(), "535") {
+				msg += "；认证失败通常表示用户名或密码/授权码不匹配。126 邮箱通常应使用邮箱账号作为用户名，并使用客户端授权码而不是网页登录密码。"
+			}
+			c.JSON(502, gin.H{"error": msg, "smtp": smtpDebugInfo(cfg)})
 			return
 		}
+		s.notify.mu.Lock()
+		s.notify.lastTest = time.Now()
+		s.notify.mu.Unlock()
 		c.JSON(200, gin.H{"message": "test mail accepted by SMTP server"})
 	})
 	a.GET("/settings", func(c *gin.Context) {
