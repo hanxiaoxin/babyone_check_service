@@ -154,8 +154,8 @@ func (s *Service) Router(token, origin string, authentication ...bool) *gin.Engi
 		bucket := int64(3600)
 		if v := c.Query("bucket_seconds"); v != "" {
 			n, e := strconv.ParseInt(v, 10, 64)
-			if e != nil || n < 60 || n > 86400 {
-				fail(c, 400, "bucket_seconds must be 60..86400")
+			if e != nil || n < 10 || n > 86400 {
+				fail(c, 400, "bucket_seconds must be 10..86400")
 				return
 			}
 			bucket = n

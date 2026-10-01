@@ -133,40 +133,50 @@ func (s *Service) timelines(c *gin.Context) {
 		fail(c, 400, "at most 100 monitors")
 		return
 	}
-	ids := []any{}
-	marks := []string{}
+	out := []gin.H{}
+	now := time.Now().Unix()
 	for _, v := range values {
-		n, e := strconv.ParseInt(v, 10, 64)
-		if e != nil || n < 1 {
+		tid, e := strconv.ParseInt(v, 10, 64)
+		if e != nil || tid < 1 {
 			fail(c, 400, "invalid monitor IDs")
 			return
 		}
-		ids = append(ids, n)
-		marks = append(marks, "?")
-	}
-	// 30 UTC dates, including today; empty buckets remain explicit in the UI.
-	end := time.Now().Unix() + 1
-	start := (end/86400 - 29) * 86400
-	args := append([]any{start, end}, ids...)
-	rows, e := s.db.Query(`SELECT target_id,(checked_at/86400)*86400,COUNT(*),SUM(ok),AVG(latency_ms) FROM results WHERE checked_at>=? AND checked_at<? AND target_id IN (`+strings.Join(marks, ",")+`) GROUP BY target_id,2 ORDER BY 2`, args...)
-	if e != nil {
-		fail(c, 500, "database error")
-		return
-	}
-	defer rows.Close()
-	out := []gin.H{}
-	for rows.Next() {
-		var tid, at, n, good int64
-		var latency float64
-		if rows.Scan(&tid, &at, &n, &good, &latency) != nil {
+		var interval int64
+		if e = s.db.QueryRow(`SELECT interval_seconds FROM targets WHERE id=?`, tid).Scan(&interval); e != nil {
+			fail(c, 404, "monitor not found")
+			return
+		}
+		if interval < 1 {
+			interval = 60
+		}
+		// The overview is deliberately a compact 30-slot strip. Each slot is
+		// exactly one configured check interval, so hover/click always describes
+		// the same real time window the monitor actually uses.
+		end := (now/interval + 1) * interval
+		start := end - interval*30
+		rows, e := s.db.Query(`SELECT (checked_at / ?)*?,COUNT(*),SUM(ok),AVG(latency_ms) FROM results WHERE target_id=? AND checked_at>=? AND checked_at<? GROUP BY 1 ORDER BY 1`, interval, interval, tid, start, end)
+		if e != nil {
 			fail(c, 500, "database error")
 			return
 		}
-		out = append(out, gin.H{"target_id": tid, "start": at, "samples": n, "successful": good, "avg_latency_ms": latency})
+		for rows.Next() {
+			var at, n, good int64
+			var latency float64
+			if rows.Scan(&at, &n, &good, &latency) != nil {
+				rows.Close()
+				fail(c, 500, "database error")
+				return
+			}
+			out = append(out, gin.H{"target_id": tid, "start": at, "samples": n, "successful": good, "avg_latency_ms": latency, "bucket_seconds": interval, "from": start, "to": end})
+		}
+		if rows.Err() != nil {
+			rows.Close()
+			fail(c, 500, "database error")
+			return
+		}
+		rows.Close()
+		// Metadata row keeps empty timelines renderable without inventing a global range.
+		out = append(out, gin.H{"target_id": tid, "meta": true, "bucket_seconds": interval, "from": start, "to": end})
 	}
-	if rows.Err() != nil {
-		fail(c, 500, "database error")
-		return
-	}
-	c.JSON(200, gin.H{"from": start, "to": end, "data": out})
+	c.JSON(200, gin.H{"data": out})
 }
